@@ -3,6 +3,7 @@ import { authenticate, authorize } from "../../../middleware/auth";
 import { asyncHandler } from "../../../middleware/asyncHandler";
 import { getSupabaseSecret } from "../../../config/supabase";
 import { ApiError } from "../../../lib/errors";
+import { adminBookingsQuerySchema } from "../../../schemas/booking";
 
 const router = Router();
 
@@ -114,30 +115,85 @@ router.get(
   })
 );
 
-/** GET /v1/admin/shops */
+/** GET /v1/admin/bookings — list bookings with optional filters */
 router.get(
-  "/shops",
-  asyncHandler(async (_req: Request, res: Response) => {
+  "/bookings",
+  asyncHandler(async (req: Request, res: Response) => {
+    const parsed = adminBookingsQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      const message = parsed.error.issues.map((i) => i.message).join("; ");
+      throw new ApiError(400, message, "VALIDATION_ERROR");
+    }
+
+    const { status, shopId, from, to, limit = 50 } = parsed.data;
     const supabase = getSupabaseSecret();
-    const { data, error } = await supabase
-      .from("barber_shops")
-      .select(`
+
+    let query = supabase
+      .from("bookings")
+      .select(
+        `
         id,
-        name,
-        description,
-        address,
-        city,
+        booking_date,
+        start_time,
+        end_time,
         status,
+        payment_status,
+        price_pkr,
+        commission_pkr,
         created_at,
-        profiles!barber_shops_owner_id_fkey (name, email, phone)
-      `)
-      .order("created_at", { ascending: false });
+        shop_id,
+        customer_id,
+        worker_id,
+        barber_shops (name, city),
+        profiles!bookings_customer_id_fkey (name, email),
+        shop_services (name),
+        workers (name)
+      `
+      )
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (status) query = query.eq("status", status);
+    if (shopId) query = query.eq("shop_id", shopId);
+    if (from) query = query.gte("booking_date", from);
+    if (to) query = query.lte("booking_date", to);
+
+    const { data, error } = await query;
 
     if (error) {
       throw new ApiError(500, error.message, "DB_ERROR");
     }
 
-    res.json({ shops: data || [] });
+    res.json({ bookings: data ?? [] });
+  })
+);
+
+/** GET /v1/admin/shops */
+router.get(
+  "/shops",
+  asyncHandler(async (_req: Request, res: Response) => {
+    const supabase = getSupabaseSecret();
+    const shopColumns =
+      "id, name, description, address, city, latitude, longitude, business_phone, website_url, location_updated_at, status, created_at, owner_id";
+
+    const { data: withOwner, error } = await supabase
+      .from("barber_shops")
+      .select(`${shopColumns}, profiles!barber_shops_owner_id_fkey (name, email, phone)`)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      const { data: shopsOnly, error: fallbackError } = await supabase
+        .from("barber_shops")
+        .select(shopColumns)
+        .order("created_at", { ascending: false });
+      if (fallbackError) {
+        throw new ApiError(500, fallbackError.message, "DB_ERROR");
+      }
+      res.json({ shops: shopsOnly || [] });
+      return;
+    }
+
+    res.json({ shops: withOwner || [] });
   })
 );
 

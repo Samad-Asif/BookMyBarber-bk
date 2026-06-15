@@ -1,37 +1,305 @@
 import { getSupabaseSecret } from "../config/supabase";
 import { ApiError } from "../lib/errors";
+import {
+  BOOKING_MIN_LEAD_MINUTES,
+  dateStringInTimezone,
+  dayOfWeekInTimezone,
+  DEFAULT_SHOP_TIMEZONE,
+  minutesOfDayInTimezone,
+  minutesToTimeString,
+  parseTimeToMinutes,
+  rangesOverlap,
+} from "../lib/booking-time";
 
 const SLOT_STEP_MINUTES = 15;
 const COMMISSION_RATE = 0.1;
+const BLOCKING_STATUSES = ["pending", "approved"] as const;
 
 export function computeCommission(pricePkr: number): number {
   return Math.round(pricePkr * COMMISSION_RATE);
-}
-
-function parseTimeToMinutes(time: string): number {
-  const [h, m] = time.split(":").map(Number);
-  return h * 60 + (m || 0);
-}
-
-function minutesToTimeString(minutes: number): string {
-  const h = Math.floor(minutes / 60);
-  const m = minutes % 60;
-  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`;
-}
-
-function rangesOverlap(
-  aStart: number,
-  aEnd: number,
-  bStart: number,
-  bEnd: number
-): boolean {
-  return aStart < bEnd && bStart < aEnd;
 }
 
 export interface SlotResult {
   startTime: string;
   endTime: string;
   durationMinutes: number;
+}
+
+export interface SlotBookableParams {
+  shopId: string;
+  date: string;
+  startTime: string;
+  endTime: string;
+  workerId?: string | null;
+  excludeBookingId?: string;
+  requireApproved?: boolean;
+  checkPast?: boolean;
+  timezone?: string;
+}
+
+interface ShopSlotContext {
+  shopId: string;
+  ownerId: string | null;
+  timezone: string;
+  openMin: number;
+  closeMin: number;
+  bookingRanges: { start: number; end: number }[];
+  busyRanges: { start: number; end: number }[];
+}
+
+function validateDateString(date: string): void {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    throw new ApiError(400, "Invalid date format (YYYY-MM-DD)", "VALIDATION_ERROR");
+  }
+  const parsed = new Date(`${date}T12:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new ApiError(400, "Invalid date format (YYYY-MM-DD)", "VALIDATION_ERROR");
+  }
+}
+
+function assertWithinWorkingHours(
+  startMin: number,
+  endMin: number,
+  openMin: number,
+  closeMin: number
+): void {
+  if (startMin < openMin || endMin > closeMin) {
+    throw new ApiError(
+      400,
+      "Selected time is outside shop working hours",
+      "OUTSIDE_HOURS"
+    );
+  }
+}
+
+function assertNotPastSlot(
+  date: string,
+  startMin: number,
+  timezone: string
+): void {
+  const now = new Date();
+  const today = dateStringInTimezone(now, timezone);
+  if (date < today) {
+    throw new ApiError(400, "Cannot book a date in the past", "PAST_SLOT");
+  }
+  if (date > today) return;
+
+  const nowMin = minutesOfDayInTimezone(now, timezone);
+  if (startMin < nowMin + BOOKING_MIN_LEAD_MINUTES) {
+    throw new ApiError(
+      400,
+      `Book at least ${BOOKING_MIN_LEAD_MINUTES} minutes ahead`,
+      "PAST_SLOT"
+    );
+  }
+}
+
+async function loadShopSlotContext(
+  shopId: string,
+  date: string,
+  workerId: string | null | undefined,
+  excludeBookingId?: string,
+  timezoneOverride?: string
+): Promise<ShopSlotContext> {
+  const supabase = getSupabaseSecret();
+
+  const { data: shop, error: shopErr } = await supabase
+    .from("barber_shops")
+    .select("owner_id, timezone")
+    .eq("id", shopId)
+    .single();
+
+  if (shopErr || !shop) {
+    throw new ApiError(404, "Barber shop not found", "NOT_FOUND");
+  }
+
+  const timezone =
+    timezoneOverride ??
+    (typeof shop.timezone === "string" && shop.timezone.length > 0
+      ? shop.timezone
+      : DEFAULT_SHOP_TIMEZONE);
+
+  const dayOfWeek = dayOfWeekInTimezone(date, timezone);
+
+  const { data: hours } = await supabase
+    .from("working_hours")
+    .select("start_time, end_time")
+    .eq("shop_id", shopId)
+    .eq("day_of_week", dayOfWeek)
+    .eq("is_active", true);
+
+  if (!hours?.length) {
+    throw new ApiError(400, "Shop is closed on this day", "SHOP_CLOSED");
+  }
+
+  const wh = hours[0];
+  const openMin = parseTimeToMinutes(wh.start_time as string);
+  const closeMin = parseTimeToMinutes(wh.end_time as string);
+
+  let bookingsQuery = supabase
+    .from("bookings")
+    .select("id, start_time, end_time, worker_id")
+    .eq("shop_id", shopId)
+    .eq("booking_date", date)
+    .in("status", [...BLOCKING_STATUSES]);
+
+  if (excludeBookingId) {
+    bookingsQuery = bookingsQuery.neq("id", excludeBookingId);
+  }
+
+  if (workerId) {
+    bookingsQuery = bookingsQuery.or(
+      `worker_id.eq.${workerId},worker_id.is.null`
+    );
+  }
+
+  const { data: existingBookings } = await bookingsQuery;
+
+  const bookingRanges = (existingBookings ?? []).map((b) => ({
+    start: parseTimeToMinutes(b.start_time as string),
+    end: parseTimeToMinutes(b.end_time as string),
+  }));
+
+  const ownerId = shop.owner_id as string | null;
+  const userIds = ownerId ? [ownerId] : [];
+
+  const busyRanges: { start: number; end: number }[] = [];
+
+  if (userIds.length > 0) {
+    const dayStart = new Date(`${date}T00:00:00.000Z`);
+    const dayEnd = new Date(`${date}T23:59:59.999Z`);
+
+    const { data: busyBlocks } = await supabase
+      .from("calendar_busy_blocks")
+      .select("start_at, end_at")
+      .in("user_id", userIds)
+      .lt("start_at", dayEnd.toISOString())
+      .gt("end_at", dayStart.toISOString());
+
+    for (const block of busyBlocks ?? []) {
+      const blockStart = new Date(block.start_at as string);
+      const blockEnd = new Date(block.end_at as string);
+      const startDate = dateStringInTimezone(blockStart, timezone);
+      const endDate = dateStringInTimezone(blockEnd, timezone);
+
+      if (startDate !== date && endDate !== date) {
+        const startMin = Math.max(
+          0,
+          minutesOfDayInTimezone(blockStart, timezone)
+        );
+        const endMin = Math.min(24 * 60, minutesOfDayInTimezone(blockEnd, timezone));
+        if (startMin < endMin) busyRanges.push({ start: startMin, end: endMin });
+      } else {
+        const startMin =
+          startDate === date ? minutesOfDayInTimezone(blockStart, timezone) : 0;
+        const endMin =
+          endDate === date ? minutesOfDayInTimezone(blockEnd, timezone) : 24 * 60;
+        if (startMin < endMin) busyRanges.push({ start: startMin, end: endMin });
+      }
+    }
+  }
+
+  return {
+    shopId,
+    ownerId,
+    timezone,
+    openMin,
+    closeMin,
+    bookingRanges,
+    busyRanges,
+  };
+}
+
+function slotHasConflict(
+  startMin: number,
+  endMin: number,
+  ctx: ShopSlotContext
+): boolean {
+  const conflictsBooking = ctx.bookingRanges.some((r) =>
+    rangesOverlap(startMin, endMin, r.start, r.end)
+  );
+  const conflictsBusy = ctx.busyRanges.some((r) =>
+    rangesOverlap(startMin, endMin, r.start, r.end)
+  );
+  return conflictsBooking || conflictsBusy;
+}
+
+/** Throws ApiError when slot cannot be booked (single source of truth for slots API + create/approve). */
+export async function assertSlotBookable(params: SlotBookableParams): Promise<void> {
+  validateDateString(params.date);
+
+  const startMin = parseTimeToMinutes(params.startTime);
+  const endMin = parseTimeToMinutes(params.endTime);
+
+  if (endMin <= startMin) {
+    throw new ApiError(400, "endTime must be after startTime", "VALIDATION_ERROR");
+  }
+
+  const supabase = getSupabaseSecret();
+  const { data: shop, error: shopErr } = await supabase
+    .from("barber_shops")
+    .select("status, owner_id, timezone")
+    .eq("id", params.shopId)
+    .single();
+
+  if (shopErr || !shop) {
+    throw new ApiError(404, "Barber shop not found", "NOT_FOUND");
+  }
+
+  if (params.requireApproved && shop.status !== "approved") {
+    throw new ApiError(
+      403,
+      "This shop is not available for booking",
+      "SHOP_NOT_APPROVED"
+    );
+  }
+
+  const timezone =
+    params.timezone ??
+    (typeof shop.timezone === "string" && shop.timezone.length > 0
+      ? shop.timezone
+      : DEFAULT_SHOP_TIMEZONE);
+
+  if (params.checkPast !== false) {
+    assertNotPastSlot(params.date, startMin, timezone);
+  }
+
+  const ctx = await loadShopSlotContext(
+    params.shopId,
+    params.date,
+    params.workerId ?? null,
+    params.excludeBookingId,
+    timezone
+  );
+
+  assertWithinWorkingHours(startMin, endMin, ctx.openMin, ctx.closeMin);
+
+  if (slotHasConflict(startMin, endMin, ctx)) {
+    throw new ApiError(409, "Selected slot is no longer available", "SLOT_TAKEN");
+  }
+}
+
+export async function isSlotAvailable(params: {
+  shopId: string;
+  date: string;
+  startTime: string;
+  endTime: string;
+  workerId?: string | null;
+  excludeBookingId?: string;
+}): Promise<boolean> {
+  try {
+    await assertSlotBookable({
+      ...params,
+      requireApproved: false,
+      checkPast: false,
+    });
+    return true;
+  } catch (err) {
+    if (err instanceof ApiError && err.code === "SLOT_TAKEN") {
+      return false;
+    }
+    throw err;
+  }
 }
 
 export async function getAvailableSlots(params: {
@@ -42,12 +310,7 @@ export async function getAvailableSlots(params: {
   durationMinutes?: number;
 }): Promise<{ slots: SlotResult[]; durationMinutes: number; pricePkr: number }> {
   const supabase = getSupabaseSecret();
-  const bookingDate = new Date(params.date);
-  if (Number.isNaN(bookingDate.getTime())) {
-    throw new ApiError(400, "Invalid date format (YYYY-MM-DD)", "VALIDATION_ERROR");
-  }
-
-  const dayOfWeek = bookingDate.getUTCDay();
+  validateDateString(params.date);
 
   const { data: service, error: svcErr } = await supabase
     .from("shop_services")
@@ -62,105 +325,41 @@ export async function getAvailableSlots(params: {
   }
 
   const durationMinutes =
-    params.durationMinutes ?? service.duration_minutes;
-  const pricePkr = service.price_pkr;
+    params.durationMinutes ?? (service.duration_minutes as number);
+  const pricePkr = service.price_pkr as number;
 
   if (durationMinutes <= 0) {
     throw new ApiError(400, "durationMinutes must be positive", "VALIDATION_ERROR");
   }
 
-  const { data: hours } = await supabase
-    .from("working_hours")
-    .select("*")
-    .eq("shop_id", params.shopId)
-    .eq("day_of_week", dayOfWeek)
-    .eq("is_active", true);
-
-  if (!hours?.length) {
-    return { slots: [], durationMinutes, pricePkr };
-  }
-
-  const wh = hours[0];
-  const openMin = parseTimeToMinutes(wh.start_time);
-  const closeMin = parseTimeToMinutes(wh.end_time);
-
-  let bookingsQuery = supabase
-    .from("bookings")
-    .select("start_time, end_time, worker_id")
-    .eq("shop_id", params.shopId)
-    .eq("booking_date", params.date)
-    .in("status", ["pending", "approved"]);
-
-  if (params.workerId) {
-    bookingsQuery = bookingsQuery.or(
-      `worker_id.eq.${params.workerId},worker_id.is.null`
+  let ctx: ShopSlotContext;
+  try {
+    ctx = await loadShopSlotContext(
+      params.shopId,
+      params.date,
+      params.workerId ?? null
     );
-  }
-
-  const { data: existingBookings } = await bookingsQuery;
-
-  const bookingRanges = (existingBookings ?? []).map((b) => ({
-    start: parseTimeToMinutes(b.start_time),
-    end: parseTimeToMinutes(b.end_time),
-  }));
-
-  const ownerId = await supabase
-    .from("barber_shops")
-    .select("owner_id")
-    .eq("id", params.shopId)
-    .single();
-
-  const userIds = [ownerId.data?.owner_id].filter(Boolean) as string[];
-
-  const dayStart = new Date(`${params.date}T00:00:00.000Z`);
-  const dayEnd = new Date(`${params.date}T23:59:59.999Z`);
-
-  const { data: busyBlocks } = await supabase
-    .from("calendar_busy_blocks")
-    .select("start_at, end_at, user_id")
-    .in("user_id", userIds)
-    .lt("start_at", dayEnd.toISOString())
-    .gt("end_at", dayStart.toISOString());
-
-  const busyRanges: { start: number; end: number }[] = [];
-
-  for (const block of busyBlocks ?? []) {
-    const blockStart = new Date(block.start_at);
-    const blockEnd = new Date(block.end_at);
-    if (blockStart.toISOString().slice(0, 10) !== params.date &&
-        blockEnd.toISOString().slice(0, 10) !== params.date) {
-      const startMin = Math.max(0, blockStart.getUTCHours() * 60 + blockStart.getUTCMinutes());
-      const endMin = Math.min(24 * 60, blockEnd.getUTCHours() * 60 + blockEnd.getUTCMinutes());
-      if (startMin < endMin) busyRanges.push({ start: startMin, end: endMin });
-    } else {
-      const startMin =
-        blockStart.toISOString().slice(0, 10) === params.date
-          ? blockStart.getUTCHours() * 60 + blockStart.getUTCMinutes()
-          : 0;
-      const endMin =
-        blockEnd.toISOString().slice(0, 10) === params.date
-          ? blockEnd.getUTCHours() * 60 + blockEnd.getUTCMinutes()
-          : 24 * 60;
-      busyRanges.push({ start: startMin, end: endMin });
+  } catch (err) {
+    if (err instanceof ApiError && err.code === "SHOP_CLOSED") {
+      return { slots: [], durationMinutes, pricePkr };
     }
+    throw err;
   }
 
   const slots: SlotResult[] = [];
 
   for (
-    let start = openMin;
-    start + durationMinutes <= closeMin;
+    let start = ctx.openMin;
+    start + durationMinutes <= ctx.closeMin;
     start += SLOT_STEP_MINUTES
   ) {
     const end = start + durationMinutes;
-    const conflictsBooking = bookingRanges.some((r) =>
-      rangesOverlap(start, end, r.start, r.end)
-    );
-    const conflictsBusy = busyRanges.some((r) =>
-      rangesOverlap(start, end, r.start, r.end)
-    );
-
-    if (!conflictsBooking && !conflictsBusy) {
+    if (!slotHasConflict(start, end, ctx)) {
+      try {
+        assertNotPastSlot(params.date, start, ctx.timezone);
+      } catch {
+        continue;
+      }
       slots.push({
         startTime: minutesToTimeString(start),
         endTime: minutesToTimeString(end),
@@ -170,36 +369,4 @@ export async function getAvailableSlots(params: {
   }
 
   return { slots, durationMinutes, pricePkr };
-}
-
-export async function isSlotAvailable(params: {
-  shopId: string;
-  date: string;
-  startTime: string;
-  endTime: string;
-  workerId?: string;
-  excludeBookingId?: string;
-}): Promise<boolean> {
-  const supabase = getSupabaseSecret();
-
-  let query = supabase
-    .from("bookings")
-    .select("id, start_time, end_time")
-    .eq("shop_id", params.shopId)
-    .eq("booking_date", params.date)
-    .in("status", ["pending", "approved"]);
-
-  if (params.excludeBookingId) {
-    query = query.neq("id", params.excludeBookingId);
-  }
-
-  const { data: bookings } = await query;
-  const newStart = parseTimeToMinutes(params.startTime);
-  const newEnd = parseTimeToMinutes(params.endTime);
-
-  return !(bookings ?? []).some((b) => {
-    const bStart = parseTimeToMinutes(b.start_time);
-    const bEnd = parseTimeToMinutes(b.end_time);
-    return rangesOverlap(newStart, newEnd, bStart, bEnd);
-  });
 }

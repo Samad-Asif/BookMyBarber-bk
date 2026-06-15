@@ -3,6 +3,7 @@ import { authenticate, authorize } from "../../../middleware/auth";
 import { asyncHandler } from "../../../middleware/asyncHandler";
 import { ApiError } from "../../../lib/errors";
 import { isSafepayConfigured } from "../../../config/safepay";
+import { checkoutBodySchema } from "../../../schemas/payment";
 import {
   createCheckoutSession,
   fetchTrackerStatus,
@@ -32,23 +33,18 @@ router.post(
       );
     }
 
-    const { amountPkr, bookingId, source } = req.body ?? {};
-    const amount = Number(amountPkr);
-
-    if (!amount || amount <= 0) {
-      throw new ApiError(
-        400,
-        "amountPkr must be a positive number (rupees)",
-        "VALIDATION_ERROR"
-      );
+    const parsed = checkoutBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      const message = parsed.error.issues.map((i) => i.message).join("; ");
+      throw new ApiError(400, message, "VALIDATION_ERROR");
     }
 
+    const { amountPkr, bookingId, source } = parsed.data;
     const checkoutSource =
       source === "mobile" ? ("mobile" as const) : ("hosted" as const);
 
     const { checkoutUrl, trackerToken } = await createCheckoutSession({
-      amountPkr: amount,
-      userId: req.user!.id,
+      amountPkr,
       bookingId,
       source: checkoutSource,
     });
@@ -56,16 +52,16 @@ router.post(
     const payment = await createPendingPayment({
       userId: req.user!.id,
       trackerToken,
-      amountPkr: pkrToLowestDenomination(amount),
+      amountPkr: pkrToLowestDenomination(amountPkr),
       bookingId,
-      metadata: { checkout_source: checkoutSource },
+      metadata: { checkout_source: checkoutSource, order_id: bookingId ?? null },
     });
 
     res.status(201).json({
       checkoutUrl,
       trackerToken,
       paymentId: payment.id,
-      amountPkr: amount,
+      amountPkr,
       currency: "PKR",
     });
   })

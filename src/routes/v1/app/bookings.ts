@@ -6,6 +6,11 @@ import { ApiError } from "../../../lib/errors";
 import { getShopOwnerId } from "../../../lib/shop";
 import { param } from "../../../lib/params";
 import {
+  approveBookingBodySchema,
+  createBookingBodySchema,
+  rejectBookingBodySchema,
+} from "../../../schemas/booking";
+import {
   approveBooking,
   createBooking,
   listCustomerBookings,
@@ -19,35 +24,15 @@ router.post(
   authenticate,
   authorize("customer"),
   asyncHandler(async (req: Request, res: Response) => {
-    const {
-      shopId,
-      serviceId,
-      workerId,
-      bookingDate,
-      startTime,
-      requestedDurationMinutes,
-      requestedPricePkr,
-      customerNotes,
-    } = req.body ?? {};
-
-    if (!shopId || !serviceId || !bookingDate || !startTime) {
-      throw new ApiError(
-        400,
-        "shopId, serviceId, bookingDate, and startTime are required",
-        "VALIDATION_ERROR"
-      );
+    const parsed = createBookingBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      const message = parsed.error.issues.map((i) => i.message).join("; ");
+      throw new ApiError(400, message, "VALIDATION_ERROR");
     }
 
     const booking = await createBooking({
       customerId: req.user!.id,
-      shopId,
-      serviceId,
-      workerId,
-      bookingDate,
-      startTime,
-      requestedDurationMinutes,
-      requestedPricePkr,
-      customerNotes,
+      ...parsed.data,
     });
 
     res.status(201).json({ booking });
@@ -79,13 +64,16 @@ router.patch(
   authenticate,
   authorize("barber"),
   asyncHandler(async (req: Request, res: Response) => {
-    const { finalDurationMinutes, finalPricePkr, barberNotes } = req.body ?? {};
+    const parsed = approveBookingBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      const message = parsed.error.issues.map((i) => i.message).join("; ");
+      throw new ApiError(400, message, "VALIDATION_ERROR");
+    }
+
     const booking = await approveBooking({
       bookingId: param(req, "id"),
       barberId: req.user!.id,
-      finalDurationMinutes,
-      finalPricePkr,
-      barberNotes,
+      ...parsed.data,
     });
     res.json({ booking });
   })
@@ -96,8 +84,14 @@ router.patch(
   authenticate,
   authorize("barber"),
   asyncHandler(async (req: Request, res: Response) => {
+    const parsed = rejectBookingBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      const message = parsed.error.issues.map((i) => i.message).join("; ");
+      throw new ApiError(400, message, "VALIDATION_ERROR");
+    }
+
     const supabase = getSupabaseSecret();
-    const { barberNotes } = req.body ?? {};
+    const { barberNotes } = parsed.data;
 
     const { data: booking } = await supabase
       .from("bookings")
@@ -139,6 +133,14 @@ router.patch(
       .single();
 
     if (!booking) throw new ApiError(404, "Booking not found", "NOT_FOUND");
+
+    if (!["pending", "approved"].includes(booking.status as string)) {
+      throw new ApiError(
+        400,
+        "Only pending or approved bookings can be cancelled",
+        "INVALID_STATE"
+      );
+    }
 
     const isCustomer = booking.customer_id === req.user!.id;
     const ownerId = await getShopOwnerId(booking.shop_id);

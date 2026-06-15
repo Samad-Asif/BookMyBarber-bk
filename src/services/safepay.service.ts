@@ -18,9 +18,38 @@ export function pkrToLowestDenomination(rupees: number): number {
   return Math.round(rupees * 100);
 }
 
+function safepayErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object" && "message" in err) {
+    return String((err as { message: unknown }).message);
+  }
+  return "SafePay request failed";
+}
+
+/** Map SDK / API errors to ApiError for Express handler */
+export function toSafepayApiError(err: unknown): ApiError {
+  if (err instanceof ApiError) return err;
+
+  const message = safepayErrorMessage(err);
+  const name =
+    err && typeof err === "object" && "type" in err
+      ? String((err as { type: unknown }).type)
+      : err instanceof Error
+        ? err.name
+        : "";
+
+  if (name === "SafepayInvalidRequestError") {
+    return new ApiError(400, message, "SAFEPAY_INVALID_REQUEST");
+  }
+  if (name === "SafepayAuthenticationError") {
+    return new ApiError(502, message, "SAFEPAY_AUTH_FAILED");
+  }
+
+  return new ApiError(502, message, "SAFEPAY_CHECKOUT_FAILED");
+}
+
 export async function createCheckoutSession(params: {
   amountPkr: number;
-  userId?: string;
   customerToken?: string;
   bookingId?: string;
   source?: "hosted" | "mobile";
@@ -29,24 +58,39 @@ export async function createCheckoutSession(params: {
   const env = getSafepayEnv();
   const amount = pkrToLowestDenomination(params.amountPkr);
 
-  const sessionResponse = await safepay.payments.session.setup({
+  const setupPayload: Record<string, unknown> = {
     merchant_api_key: env.merchantApiKey,
-    user: params.customerToken,
     intent: "CYBERSOURCE",
     mode: "payment",
     entry_mode: "raw",
     currency: "PKR",
     amount,
-    metadata: {
-      user_id: params.userId,
-      booking_id: params.bookingId,
-    },
     include_fees: false,
-  });
+  };
+
+  if (params.customerToken) {
+    setupPayload.user = params.customerToken;
+  }
+
+  // SafePay only accepts documented metadata keys (e.g. order_id), not user_id/booking_id
+  if (params.bookingId) {
+    setupPayload.metadata = { order_id: params.bookingId };
+  }
+
+  let sessionResponse: unknown;
+  try {
+    sessionResponse = await safepay.payments.session.setup(setupPayload);
+  } catch (err) {
+    throw toSafepayApiError(err);
+  }
+
+  const session = sessionResponse as {
+    data?: { tracker?: { token?: string } };
+    tracker?: { token?: string };
+  };
 
   const trackerToken =
-    sessionResponse?.data?.tracker?.token ??
-    sessionResponse?.tracker?.token;
+    session?.data?.tracker?.token ?? session?.tracker?.token;
 
   if (!trackerToken) {
     throw new ApiError(
@@ -56,11 +100,15 @@ export async function createCheckoutSession(params: {
     );
   }
 
-  const passportResponse = await safepay.client.passport.create();
-  const tbt =
-    passportResponse?.data ??
-    passportResponse?.token ??
-    passportResponse;
+  let passportResponse: unknown;
+  try {
+    passportResponse = await safepay.client.passport.create();
+  } catch (err) {
+    throw toSafepayApiError(err);
+  }
+
+  const passport = passportResponse as { data?: string; token?: string };
+  const tbt = passport?.data ?? passport?.token ?? passportResponse;
 
   if (!tbt || typeof tbt !== "string") {
     throw new ApiError(
@@ -75,10 +123,10 @@ export async function createCheckoutSession(params: {
     tbt,
     tracker: trackerToken,
     source: params.source ?? "hosted",
-    user_id: params.customerToken,
     redirect_url: env.redirectUrl,
     cancel_url: env.cancelUrl,
-    order_id: params.bookingId,
+    ...(params.customerToken ? { user_id: params.customerToken } : {}),
+    ...(params.bookingId ? { order_id: params.bookingId } : {}),
   });
 
   return { checkoutUrl, trackerToken };
@@ -88,11 +136,20 @@ export async function fetchTrackerStatus(
   trackerToken: string
 ): Promise<TrackerStatusResult> {
   const safepay = getSafepayClient();
-  const response = await safepay.reporter.payments.fetch(trackerToken);
+  let response: unknown;
+  try {
+    response = await safepay.reporter.payments.fetch(trackerToken);
+  } catch (err) {
+    throw toSafepayApiError(err);
+  }
+
+  const res = response as {
+    data?: { tracker?: { state?: string } };
+    tracker?: { state?: string };
+  };
+
   const state =
-    response?.data?.tracker?.state ??
-    response?.tracker?.state ??
-    "UNKNOWN";
+    res?.data?.tracker?.state ?? res?.tracker?.state ?? "UNKNOWN";
 
   return {
     trackerToken,

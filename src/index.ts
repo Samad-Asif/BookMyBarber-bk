@@ -21,14 +21,34 @@ const allowedOrigins = (
   .map((o) => o.trim())
   .filter(Boolean);
 
+const relaxDevCors = process.env.CORS_RELAX_DEV !== "false";
+
+function isAllowedCorsOrigin(origin: string | undefined): boolean {
+  if (!origin) return true;
+  if (allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+    return true;
+  }
+  if (!relaxDevCors) return false;
+
+  try {
+    const { hostname, protocol } = new URL(origin);
+    if (protocol !== "http:" && protocol !== "https:") return false;
+    return (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname.endsWith(".ngrok-free.app") ||
+      hostname.endsWith(".ngrok.io") ||
+      hostname.endsWith(".ngrok.app")
+    );
+  } catch {
+    return false;
+  }
+}
+
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (
-        !origin ||
-        allowedOrigins.includes(origin) ||
-        allowedOrigins.includes("*")
-      ) {
+      if (isAllowedCorsOrigin(origin)) {
         callback(null, true);
       } else {
         callback(new Error(`CORS blocked for origin: ${origin}`));
@@ -65,6 +85,7 @@ app.use(errorHandler);
 
 app.listen(PORT, "0.0.0.0", () => {
   const sb = getSupabaseConfig();
+  console.log(`[BookMyBarber] API listening on port ${PORT}`);
   logger.info(`BookMyBarber API listening on http://0.0.0.0:${PORT}`);
   logger.info("Supabase", {
     configured: isSupabaseConfigured(),

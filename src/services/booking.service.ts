@@ -1,11 +1,38 @@
 import { getSupabaseSecret } from "../config/supabase";
 import { ApiError } from "../lib/errors";
+import { minutesToTimeString, parseTimeToMinutes } from "../lib/booking-time";
 import { assertShopOwner, getShopOwnerId } from "../lib/shop";
 import {
+  assertSlotBookable,
   computeCommission,
-  isSlotAvailable,
 } from "./availability.service";
 import { createCalendarEventForBooking } from "./calendar/calendar.service";
+
+async function assertWorkerBelongsToShop(
+  shopId: string,
+  workerId: string
+): Promise<void> {
+  const supabase = getSupabaseSecret();
+  const { data: worker } = await supabase
+    .from("workers")
+    .select("id")
+    .eq("id", workerId)
+    .eq("shop_id", shopId)
+    .maybeSingle();
+
+  if (!worker) {
+    throw new ApiError(404, "Worker not found for this shop", "NOT_FOUND");
+  }
+}
+
+function endTimeFromStartAndDuration(
+  startTime: string,
+  durationMinutes: number
+): string {
+  const startMin = parseTimeToMinutes(startTime);
+  const endMin = startMin + durationMinutes;
+  return minutesToTimeString(endMin);
+}
 
 export async function createBooking(params: {
   customerId: string;
@@ -20,6 +47,23 @@ export async function createBooking(params: {
 }) {
   const supabase = getSupabaseSecret();
 
+  const { data: shop } = await supabase
+    .from("barber_shops")
+    .select("status")
+    .eq("id", params.shopId)
+    .single();
+
+  if (!shop) {
+    throw new ApiError(404, "Barber shop not found", "NOT_FOUND");
+  }
+  if (shop.status !== "approved") {
+    throw new ApiError(
+      403,
+      "This shop is not available for booking",
+      "SHOP_NOT_APPROVED"
+    );
+  }
+
   const { data: service } = await supabase
     .from("shop_services")
     .select("*")
@@ -32,30 +76,36 @@ export async function createBooking(params: {
     throw new ApiError(404, "Service not found", "NOT_FOUND");
   }
 
+  if (params.workerId) {
+    await assertWorkerBelongsToShop(params.shopId, params.workerId);
+  }
+
   const duration =
-    params.requestedDurationMinutes ?? service.duration_minutes;
-  const price = params.requestedPricePkr ?? service.price_pkr;
+    params.requestedDurationMinutes ?? (service.duration_minutes as number);
+  const price = params.requestedPricePkr ?? (service.price_pkr as number);
+  const endTime = endTimeFromStartAndDuration(params.startTime, duration);
 
-  const [h, m] = params.startTime.split(":").map(Number);
-  const startMin = h * 60 + (m || 0);
-  const endMin = startMin + duration;
-  const endH = Math.floor(endMin / 60);
-  const endM = endMin % 60;
-  const endTime = `${String(endH).padStart(2, "0")}:${String(endM).padStart(2, "0")}:00`;
-
-  const available = await isSlotAvailable({
+  await assertSlotBookable({
     shopId: params.shopId,
     date: params.bookingDate,
     startTime: params.startTime,
     endTime,
-    workerId: params.workerId,
+    workerId: params.workerId ?? null,
+    requireApproved: true,
+    checkPast: true,
   });
 
-  if (!available) {
-    throw new ApiError(409, "Selected slot is no longer available", "SLOT_TAKEN");
-  }
-
   const commission = computeCommission(price);
+
+  await assertSlotBookable({
+    shopId: params.shopId,
+    date: params.bookingDate,
+    startTime: params.startTime,
+    endTime,
+    workerId: params.workerId ?? null,
+    requireApproved: true,
+    checkPast: true,
+  });
 
   const { data, error } = await supabase
     .from("bookings")
@@ -106,7 +156,7 @@ export async function approveBooking(params: {
     throw new ApiError(404, "Booking not found", "NOT_FOUND");
   }
 
-  const ownerId = await getShopOwnerId(booking.shop_id);
+  const ownerId = await getShopOwnerId(booking.shop_id as string);
   if (ownerId !== params.barberId) {
     throw new ApiError(403, "Not authorized for this booking", "FORBIDDEN");
   }
@@ -117,34 +167,30 @@ export async function approveBooking(params: {
 
   const finalDuration =
     params.finalDurationMinutes ??
-    booking.final_duration_minutes ??
-    booking.requested_duration_minutes ??
+    (booking.final_duration_minutes as number | null) ??
+    (booking.requested_duration_minutes as number | null) ??
     30;
   const finalPrice =
     params.finalPricePkr ??
-    booking.final_price_pkr ??
-    booking.requested_price_pkr ??
-    booking.price_pkr;
+    (booking.final_price_pkr as number | null) ??
+    (booking.requested_price_pkr as number | null) ??
+    (booking.price_pkr as number);
 
-  const [h, m] = (booking.start_time as string).split(":").map(Number);
-  const startMin = h * 60 + (m || 0);
-  const endMin = startMin + finalDuration;
-  const endH = Math.floor(endMin / 60);
-  const endM = endMin % 60;
-  const endTime = `${String(endH).padStart(2, "0")}:${String(endM).padStart(2, "0")}:00`;
+  const endTime = endTimeFromStartAndDuration(
+    booking.start_time as string,
+    finalDuration
+  );
 
-  const available = await isSlotAvailable({
-    shopId: booking.shop_id,
-    date: booking.booking_date,
-    startTime: booking.start_time,
+  await assertSlotBookable({
+    shopId: booking.shop_id as string,
+    date: booking.booking_date as string,
+    startTime: booking.start_time as string,
     endTime,
-    workerId: booking.worker_id ?? undefined,
+    workerId: (booking.worker_id as string | null) ?? null,
     excludeBookingId: params.bookingId,
+    requireApproved: false,
+    checkPast: false,
   });
-
-  if (!available) {
-    throw new ApiError(409, "Adjusted slot conflicts with another booking", "SLOT_TAKEN");
-  }
 
   const commission = computeCommission(finalPrice);
 
@@ -210,7 +256,7 @@ export async function listCustomerBookings(customerId: string) {
   const { data, error } = await supabase
     .from("bookings")
     .select(
-      `*, shop_services(name), barber_shops(name, city, address), workers(name)`
+      `*, shop_services(name), barber_shops(name, city, address, latitude, longitude), workers(name)`
     )
     .eq("customer_id", customerId)
     .order("booking_date", { ascending: false });
