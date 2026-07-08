@@ -21,6 +21,9 @@ import bookingsRouter from "./bookings";
 import aiRouter from "./ai";
 import chatRouter from "./chat";
 import feedbacksRouter from "./feedbacks";
+import workersRouter from "./workers";
+import workerServicesRouter from "./worker-services";
+import workerAvailabilityRouter from "./worker-availability";
 
 const router = Router();
 const EARTH_RADIUS_KM = 6371;
@@ -54,6 +57,9 @@ router.use("/bookings", bookingsRouter);
 router.use("/ai", aiRouter);
 router.use("/chat", chatRouter);
 router.use("/feedbacks", feedbacksRouter);
+router.use("/shops/:shopId/workers", workersRouter);
+router.use("/shops/:shopId/workers/:workerId/services", workerServicesRouter);
+router.use("/shops/:shopId/workers/:workerId/availability", workerAvailabilityRouter);
 
 /**
  * ----------------------------------------------------
@@ -270,60 +276,13 @@ router.get(
   })
 );
 
-/** POST /v1/app/shops/:id/workers — add a worker profile */
-router.post(
-  "/shops/:id/workers",
-  authenticate,
-  authorize("barber"),
-  asyncHandler(async (req: Request, res: Response) => {
-    if (!req.user) throw new ApiError(401, "Unauthorized", "UNAUTHORIZED");
-    const { id: shopId } = req.params;
-    const { name, specialties, avatarUrl, instagramHandle } = req.body ?? {};
-
-    if (!name) {
-      throw new ApiError(400, "worker name is required", "VALIDATION_ERROR");
-    }
-
-    const supabase = getSupabaseSecret();
-
-    // Verify ownership of the shop
-    const { data: shop } = await supabase
-      .from("barber_shops")
-      .select("owner_id")
-      .eq("id", shopId)
-      .single();
-
-    if (!shop || shop.owner_id !== req.user.id) {
-      throw new ApiError(403, "You do not own this shop", "FORBIDDEN");
-    }
-
-    const { data: worker, error } = await supabase
-      .from("workers")
-      .insert({
-        shop_id: shopId,
-        name,
-        specialties: specialties || [],
-        avatar_url: avatarUrl,
-        instagram_handle: instagramHandle
-      })
-      .select()
-      .single();
-
-    if (error) {
-      throw new ApiError(400, error.message, "DB_INSERT_FAILED");
-    }
-
-    res.status(201).json({ worker });
-  })
-);
-
 /**
  * ----------------------------------------------------
  * DISCOVERY & SEARCH (Customer or Barber Role)
  * ----------------------------------------------------
  */
 
-/** GET /v1/app/shops/search — query approved shops by city */
+/** GET /v1/app/shops/search — query approved shops by city or globally */
 router.get(
   "/shops/search",
   authenticate,
@@ -331,20 +290,22 @@ router.get(
   asyncHandler(async (req: Request, res: Response) => {
     const { city, query } = req.query;
 
-    if (!city) {
-      throw new ApiError(400, "city parameter is required (Gujranwala, Lahore, Vehari)", "VALIDATION_ERROR");
-    }
-
     const supabase = getSupabaseSecret();
     let dbQuery = supabase
       .from("barber_shops")
       .select("*")
-      .eq("city", city)
       .eq("status", "approved");
 
-    if (query) {
-      dbQuery = dbQuery.ilike("name", `%${query}%`);
+    if (city && typeof city === "string" && city.trim()) {
+      dbQuery = dbQuery.eq("city", city.trim());
     }
+
+    if (query && typeof query === "string" && query.trim().length >= 2) {
+      const q = `%${query.trim()}%`;
+      dbQuery = dbQuery.or(`name.ilike.${q},description.ilike.${q}`);
+    }
+
+    dbQuery = dbQuery.order("name").limit(20);
 
     const { data, error } = await dbQuery;
 

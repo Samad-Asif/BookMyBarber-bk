@@ -121,6 +121,86 @@ async function loadShopSlotContext(
 
   const dayOfWeek = dayOfWeekInTimezone(date, timezone);
 
+  // If a worker is specified, check per-worker availability first
+  if (workerId) {
+    const { data: wa } = await supabase
+      .from("worker_availability")
+      .select("start_time, end_time")
+      .eq("worker_id", workerId)
+      .eq("day_of_week", dayOfWeek)
+      .eq("is_active", true);
+
+    if (wa && wa.length > 0) {
+      // Worker has custom availability — use it instead of shop hours
+      const waRow = wa[0];
+      const openMin = parseTimeToMinutes(waRow.start_time as string);
+      const closeMin = parseTimeToMinutes(waRow.end_time as string);
+
+      let bookingsQuery = supabase
+        .from("bookings")
+        .select("id, start_time, end_time, worker_id")
+        .eq("shop_id", shopId)
+        .eq("booking_date", date)
+        .in("status", [...BLOCKING_STATUSES]);
+
+      if (excludeBookingId) {
+        bookingsQuery = bookingsQuery.neq("id", excludeBookingId);
+      }
+
+      bookingsQuery = bookingsQuery.or(
+        `worker_id.eq.${workerId},worker_id.is.null`
+      );
+
+      const { data: existingBookings } = await bookingsQuery;
+
+      const bookingRanges = (existingBookings ?? []).map((b) => ({
+        start: parseTimeToMinutes(b.start_time as string),
+        end: parseTimeToMinutes(b.end_time as string),
+      }));
+
+      // busy blocks (owner calendar)
+      const supabase2 = getSupabaseSecret();
+      let busyRanges: { start: number; end: number }[] = [];
+      if (shop.owner_id) {
+        const dayStart = new Date(`${date}T00:00:00.000Z`);
+        const dayEnd = new Date(`${date}T23:59:59.999Z`);
+        const { data: busyBlocks } = await supabase2
+          .from("calendar_busy_blocks")
+          .select("start_at, end_at")
+          .eq("user_id", shop.owner_id as string)
+          .lt("start_at", dayEnd.toISOString())
+          .gt("end_at", dayStart.toISOString());
+
+        for (const block of busyBlocks ?? []) {
+          const blockStart = new Date(block.start_at as string);
+          const blockEnd = new Date(block.end_at as string);
+          const startDate = dateStringInTimezone(blockStart, timezone);
+          const endDate = dateStringInTimezone(blockEnd, timezone);
+          if (startDate !== date && endDate !== date) {
+            const s = Math.max(0, minutesOfDayInTimezone(blockStart, timezone));
+            const e = Math.min(24 * 60, minutesOfDayInTimezone(blockEnd, timezone));
+            if (s < e) busyRanges.push({ start: s, end: e });
+          } else {
+            const s = startDate === date ? minutesOfDayInTimezone(blockStart, timezone) : 0;
+            const e = endDate === date ? minutesOfDayInTimezone(blockEnd, timezone) : 24 * 60;
+            if (s < e) busyRanges.push({ start: s, end: e });
+          }
+        }
+      }
+
+      return {
+        shopId,
+        ownerId: shop.owner_id as string | null,
+        timezone,
+        openMin,
+        closeMin,
+        bookingRanges,
+        busyRanges,
+      };
+    }
+    // No worker_availability rows → fall back to shop working_hours (below)
+  }
+
   const { data: hours } = await supabase
     .from("working_hours")
     .select("start_time, end_time")
@@ -136,7 +216,9 @@ async function loadShopSlotContext(
   const openMin = parseTimeToMinutes(wh.start_time as string);
   const closeMin = parseTimeToMinutes(wh.end_time as string);
 
-  let bookingsQuery = supabase
+  // Re-fetch supabase (closure issue)
+  const supabase2 = getSupabaseSecret();
+  let bookingsQuery = supabase2
     .from("bookings")
     .select("id, start_time, end_time, worker_id")
     .eq("shop_id", shopId)
@@ -163,13 +245,14 @@ async function loadShopSlotContext(
   const ownerId = shop.owner_id as string | null;
   const userIds = ownerId ? [ownerId] : [];
 
-  const busyRanges: { start: number; end: number }[] = [];
+  let busyRanges: { start: number; end: number }[] = [];
 
   if (userIds.length > 0) {
+    const supabase3 = getSupabaseSecret();
     const dayStart = new Date(`${date}T00:00:00.000Z`);
     const dayEnd = new Date(`${date}T23:59:59.999Z`);
 
-    const { data: busyBlocks } = await supabase
+    const { data: busyBlocks } = await supabase3
       .from("calendar_busy_blocks")
       .select("start_at, end_at")
       .in("user_id", userIds)
@@ -183,18 +266,13 @@ async function loadShopSlotContext(
       const endDate = dateStringInTimezone(blockEnd, timezone);
 
       if (startDate !== date && endDate !== date) {
-        const startMin = Math.max(
-          0,
-          minutesOfDayInTimezone(blockStart, timezone)
-        );
-        const endMin = Math.min(24 * 60, minutesOfDayInTimezone(blockEnd, timezone));
-        if (startMin < endMin) busyRanges.push({ start: startMin, end: endMin });
+        const s = Math.max(0, minutesOfDayInTimezone(blockStart, timezone));
+        const e = Math.min(24 * 60, minutesOfDayInTimezone(blockEnd, timezone));
+        if (s < e) busyRanges.push({ start: s, end: e });
       } else {
-        const startMin =
-          startDate === date ? minutesOfDayInTimezone(blockStart, timezone) : 0;
-        const endMin =
-          endDate === date ? minutesOfDayInTimezone(blockEnd, timezone) : 24 * 60;
-        if (startMin < endMin) busyRanges.push({ start: startMin, end: endMin });
+        const s = startDate === date ? minutesOfDayInTimezone(blockStart, timezone) : 0;
+        const e = endDate === date ? minutesOfDayInTimezone(blockEnd, timezone) : 24 * 60;
+        if (s < e) busyRanges.push({ start: s, end: e });
       }
     }
   }
@@ -330,6 +408,20 @@ export async function getAvailableSlots(params: {
 
   if (durationMinutes <= 0) {
     throw new ApiError(400, "durationMinutes must be positive", "VALIDATION_ERROR");
+  }
+
+  // If worker specified, verify they can perform this service
+  if (params.workerId) {
+    const { data: ws } = await supabase
+      .from("worker_services")
+      .select("id")
+      .eq("worker_id", params.workerId)
+      .eq("service_id", params.serviceId)
+      .maybeSingle();
+
+    if (!ws) {
+      throw new ApiError(400, "Worker cannot perform this service", "WORKER_NOT_QUALIFIED");
+    }
   }
 
   let ctx: ShopSlotContext;

@@ -76,8 +76,22 @@ export async function createBooking(params: {
     throw new ApiError(404, "Service not found", "NOT_FOUND");
   }
 
-  if (params.workerId) {
-    await assertWorkerBelongsToShop(params.shopId, params.workerId);
+  // Auto-pick a worker when "Any available" selected
+  let resolvedWorkerId = params.workerId ?? null;
+  if (!resolvedWorkerId) {
+    const { data: eligibleWorkers } = await supabase
+      .from("worker_services")
+      .select("worker_id")
+      .eq("service_id", params.serviceId);
+
+    if (eligibleWorkers && eligibleWorkers.length > 0) {
+      // Pick first eligible worker (future: round-robin / least-busy)
+      resolvedWorkerId = eligibleWorkers[0].worker_id;
+    }
+  }
+
+  if (resolvedWorkerId) {
+    await assertWorkerBelongsToShop(params.shopId, resolvedWorkerId);
   }
 
   const duration =
@@ -90,29 +104,19 @@ export async function createBooking(params: {
     date: params.bookingDate,
     startTime: params.startTime,
     endTime,
-    workerId: params.workerId ?? null,
+    workerId: resolvedWorkerId,
     requireApproved: true,
     checkPast: true,
   });
 
   const commission = computeCommission(price);
 
-  await assertSlotBookable({
-    shopId: params.shopId,
-    date: params.bookingDate,
-    startTime: params.startTime,
-    endTime,
-    workerId: params.workerId ?? null,
-    requireApproved: true,
-    checkPast: true,
-  });
-
   const { data, error } = await supabase
     .from("bookings")
     .insert({
       customer_id: params.customerId,
       shop_id: params.shopId,
-      worker_id: params.workerId ?? null,
+      worker_id: resolvedWorkerId,
       service_id: params.serviceId,
       booking_date: params.bookingDate,
       start_time: params.startTime,

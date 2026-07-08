@@ -5,6 +5,7 @@ import { getSupabaseSecret } from "../../../config/supabase";
 import { ApiError } from "../../../lib/errors";
 import { assertShopOwner } from "../../../lib/shop";
 import { param } from "../../../lib/params";
+import { updateWorkingHoursBodySchema } from "../../../schemas/working-hours";
 
 const router = Router({ mergeParams: true });
 
@@ -14,31 +15,25 @@ router.put(
   authorize("barber"),
   asyncHandler(async (req: Request, res: Response) => {
     const shopId = param(req, "shopId");
-    const { hours } = req.body ?? {};
-
-    if (!Array.isArray(hours)) {
-      throw new ApiError(400, "hours array is required", "VALIDATION_ERROR");
+    const parsed = updateWorkingHoursBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      const message = parsed.error.issues.map((i) => i.message).join("; ");
+      throw new ApiError(400, message, "VALIDATION_ERROR");
     }
+    const hours = parsed.data.hours;
 
     await assertShopOwner(shopId, req.user!.id);
     const supabase = getSupabaseSecret();
 
     await supabase.from("working_hours").delete().eq("shop_id", shopId);
 
-    const rows = hours.map(
-      (h: {
-        dayOfWeek: number;
-        startTime: string;
-        endTime: string;
-        isActive?: boolean;
-      }) => ({
-        shop_id: shopId,
-        day_of_week: h.dayOfWeek,
-        start_time: h.startTime,
-        end_time: h.endTime,
-        is_active: h.isActive ?? true,
-      })
-    );
+    const rows = hours.map((h) => ({
+      shop_id: shopId,
+      day_of_week: h.dayOfWeek,
+      start_time: h.startTime,
+      end_time: h.endTime,
+      is_active: h.isActive ?? true,
+    }));
 
     if (rows.length > 0) {
       const { error } = await supabase.from("working_hours").insert(rows);
