@@ -3,7 +3,8 @@ import { asyncHandler } from "../../middleware/asyncHandler";
 import { authenticate } from "../../middleware/auth";
 import { ApiError } from "../../lib/errors";
 import {
-  getSessionUser,
+  forgotPassword,
+  resetPassword,
   signInWithPassword,
   signOut,
   signUp,
@@ -11,13 +12,32 @@ import {
   getMicrosoftLoginAuthUrl,
   signInWithMicrosoftCode,
   refreshSession,
-  signUpWithPhone,
-  signInWithPhone,
-  verifyEmailOTP,
-  verifyPhoneOTP,
+  verifyEmail,
+  verifyResetCode,
+  resendVerificationCode,
 } from "../../services/auth.service";
-import { UserRole, USER_ROLES } from "../../types/auth";
-import { loadAuthEnv } from "../../config/authEnv";
+import {
+  authCodeVerifyLimiter,
+  authCredentialLimiter,
+  authEmailSendLimiter,
+  authLogoutLimiter,
+  authOAuthLimiter,
+  authRefreshLimiter,
+  authResetLimiter,
+} from "../../middleware/rateLimit";
+import {
+  forgotPasswordBodySchema,
+  googleBodySchema,
+  loginBodySchema,
+  logoutBodySchema,
+  microsoftExchangeBodySchema,
+  refreshBodySchema,
+  registerBodySchema,
+  resendVerificationBodySchema,
+  resetPasswordBodySchema,
+  verifyEmailBodySchema,
+  verifyResetCodeBodySchema,
+} from "../../schemas/auth";
 
 const router = Router();
 
@@ -25,15 +45,24 @@ function userAgent(req: Request): string | undefined {
   return req.headers["user-agent"]?.toString();
 }
 
+function parseBody<T>(
+  schema: { safeParse: (data: unknown) => { success: true; data: T } | { success: false; error: { issues: { message: string }[] } } },
+  body: unknown
+): T {
+  const parsed = schema.safeParse(body ?? {});
+  if (!parsed.success) {
+    const message = parsed.error.issues.map((i) => i.message).join("; ");
+    throw new ApiError(400, message, "VALIDATION_ERROR");
+  }
+  return parsed.data;
+}
+
 /** POST /v1/auth/login — public */
 router.post(
   "/login",
+  authCredentialLimiter,
   asyncHandler(async (req: Request, res: Response) => {
-    const { email, password } = req.body ?? {};
-    if (!email || !password) {
-      throw new ApiError(400, "email and password are required", "VALIDATION_ERROR");
-    }
-
+    const { email, password } = parseBody(loginBodySchema, req.body);
     const result = await signInWithPassword(email, password, userAgent(req));
     res.json(result);
   })
@@ -42,16 +71,11 @@ router.post(
 /** POST /v1/auth/register — public */
 router.post(
   "/register",
+  authCredentialLimiter,
   asyncHandler(async (req: Request, res: Response) => {
-    const { email, password, role } = req.body ?? {};
-    if (!email || !password) {
-      throw new ApiError(400, "email and password are required", "VALIDATION_ERROR");
-    }
+    const body = parseBody(registerBodySchema, req.body);
 
-    const assignedRole: UserRole =
-      role && USER_ROLES.includes(role) ? role : "customer";
-
-    if (assignedRole === "admin") {
+    if (body.role === "admin") {
       throw new ApiError(
         403,
         "Admin accounts cannot be self-registered",
@@ -59,52 +83,43 @@ router.post(
       );
     }
 
-    const result = await signUp(email, password, assignedRole, userAgent(req));
+    const result = await signUp(body.email, body.password, body.role, {
+      name: body.name,
+      city: body.city,
+      userAgent: userAgent(req),
+    });
     res.status(201).json(result);
   })
 );
 
-/** POST /v1/auth/register-phone — deferred */
-router.post(
-  "/register-phone",
-  asyncHandler(async () => {
-    await signUpWithPhone();
-  })
-);
-
-/** POST /v1/auth/login-phone — deferred */
-router.post(
-  "/login-phone",
-  asyncHandler(async () => {
-    await signInWithPhone();
-  })
-);
-
-/** POST /v1/auth/verify-email — deferred */
+/** POST /v1/auth/verify-email — public */
 router.post(
   "/verify-email",
-  asyncHandler(async () => {
-    await verifyEmailOTP();
+  authCodeVerifyLimiter,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { email, code } = parseBody(verifyEmailBodySchema, req.body);
+    const result = await verifyEmail(email, code);
+    res.json(result);
   })
 );
 
-/** POST /v1/auth/verify-phone — deferred */
+/** POST /v1/auth/resend-verification — public */
 router.post(
-  "/verify-phone",
-  asyncHandler(async () => {
-    await verifyPhoneOTP();
+  "/resend-verification",
+  authEmailSendLimiter,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { email } = parseBody(resendVerificationBodySchema, req.body);
+    const result = await resendVerificationCode(email);
+    res.json(result);
   })
 );
 
 /** POST /v1/auth/google — public */
 router.post(
   "/google",
+  authOAuthLimiter,
   asyncHandler(async (req: Request, res: Response) => {
-    const { idToken } = req.body ?? {};
-    if (!idToken) {
-      throw new ApiError(400, "idToken is required", "VALIDATION_ERROR");
-    }
-
+    const { idToken } = parseBody(googleBodySchema, req.body);
     const result = await signInWithGoogle(idToken, userAgent(req));
     res.json(result);
   })
@@ -113,6 +128,7 @@ router.post(
 /** GET /v1/auth/microsoft/connect — public */
 router.get(
   "/microsoft/connect",
+  authOAuthLimiter,
   asyncHandler(async (req: Request, res: Response) => {
     const redirectUri =
       typeof req.query.redirectUri === "string"
@@ -127,49 +143,15 @@ router.get(
   })
 );
 
-/** GET /v1/auth/microsoft/callback — dev/web OAuth handoff */
-router.get(
-  "/microsoft/callback",
-  asyncHandler(async (req: Request, res: Response) => {
-    const code = typeof req.query.code === "string" ? req.query.code : null;
-    if (!code) {
-      throw new ApiError(400, "code is required", "VALIDATION_ERROR");
-    }
-
-    const env = loadAuthEnv();
-    const redirectUri =
-      process.env.MICROSOFT_AUTH_CALLBACK_URI ??
-      "http://localhost:5000/v1/auth/microsoft/callback";
-
-    const result = await signInWithMicrosoftCode(
-      code,
-      redirectUri,
-      userAgent(req)
-    );
-
-    const mobileRedirect =
-      process.env.MOBILE_AUTH_REDIRECT ?? "bookmybarber://auth-complete";
-    const params = new URLSearchParams({
-      access_token: result.session.access_token,
-      refresh_token: result.session.refresh_token,
-    });
-    res.redirect(`${mobileRedirect}?${params.toString()}`);
-  })
-);
-
 /** POST /v1/auth/microsoft/exchange — public (mobile PKCE/code) */
 router.post(
   "/microsoft/exchange",
+  authOAuthLimiter,
   asyncHandler(async (req: Request, res: Response) => {
-    const { code, redirectUri } = req.body ?? {};
-    if (!code || !redirectUri) {
-      throw new ApiError(
-        400,
-        "code and redirectUri are required",
-        "VALIDATION_ERROR"
-      );
-    }
-
+    const { code, redirectUri } = parseBody(
+      microsoftExchangeBodySchema,
+      req.body
+    );
     const result = await signInWithMicrosoftCode(
       code,
       redirectUri,
@@ -182,25 +164,55 @@ router.post(
 /** POST /v1/auth/refresh — public */
 router.post(
   "/refresh",
+  authRefreshLimiter,
   asyncHandler(async (req: Request, res: Response) => {
-    const refreshToken =
-      req.body?.refresh_token ?? req.body?.refreshToken ?? null;
-    if (!refreshToken) {
-      throw new ApiError(400, "refresh_token is required", "VALIDATION_ERROR");
-    }
-
-    const result = await refreshSession(refreshToken, userAgent(req));
+    const { refresh_token } = parseBody(refreshBodySchema, req.body);
+    const result = await refreshSession(refresh_token, userAgent(req));
     res.json(result);
   })
 );
 
-/** POST /v1/auth/logout — authenticated */
+/** POST /v1/auth/forgot-password — public */
+router.post(
+  "/forgot-password",
+  authEmailSendLimiter,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { email } = parseBody(forgotPasswordBodySchema, req.body);
+    const result = await forgotPassword(email);
+    res.json(result);
+  })
+);
+
+/** POST /v1/auth/verify-reset-code — public */
+router.post(
+  "/verify-reset-code",
+  authCodeVerifyLimiter,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { email, code } = parseBody(verifyResetCodeBodySchema, req.body);
+    const result = await verifyResetCode(email, code);
+    res.json(result);
+  })
+);
+
+/** POST /v1/auth/reset-password — public */
+router.post(
+  "/reset-password",
+  authResetLimiter,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { resetToken, password } = parseBody(resetPasswordBodySchema, req.body);
+    const result = await resetPassword(resetToken, password);
+    res.json(result);
+  })
+);
+
+/** POST /v1/auth/logout — public
+ *  No authenticate middleware. Refresh token validated server-side. */
 router.post(
   "/logout",
-  authenticate,
+  authLogoutLimiter,
   asyncHandler(async (req: Request, res: Response) => {
-    const refreshToken =
-      req.body?.refresh_token ?? req.body?.refreshToken ?? undefined;
+    const body = parseBody(logoutBodySchema, req.body);
+    const refreshToken = body.refresh_token ?? body.refreshToken;
     await signOut(refreshToken);
     res.json({ message: "Logged out" });
   })
@@ -211,6 +223,8 @@ router.get(
   "/me",
   authenticate,
   asyncHandler(async (req: Request, res: Response) => {
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.set("ETag", `"${Date.now()}"`);
     res.json({ user: req.user });
   })
 );

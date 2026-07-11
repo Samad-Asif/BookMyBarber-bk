@@ -34,8 +34,8 @@ export interface AuthSessionResponse {
 }
 
 export interface AuthSignupPendingResponse {
-  user: AuthenticatedUser;
-  requiresConfirmation: true;
+  requiresEmailVerification: true;
+  email: string;
 }
 
 interface ProfileRow {
@@ -47,6 +47,20 @@ interface ProfileRow {
   password_hash: string | null;
   google_sub: string | null;
   microsoft_oid: string | null;
+  email_verified_at: string | null;
+}
+
+const PROFILE_SELECT =
+  "id, email, phone, name, role, password_hash, google_sub, microsoft_oid, email_verified_at";
+
+function generateEmailCode(): string {
+  return crypto
+    .randomBytes(4)
+    .toString("base64url")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 6)
+    .padStart(6, "A");
 }
 
 function getAuthEnv() {
@@ -159,9 +173,7 @@ async function findProfileByEmail(email: string): Promise<ProfileRow | null> {
   const supabase = getSupabaseSecret();
   const { data, error } = await supabase
     .from("profiles")
-    .select(
-      "id, email, phone, name, role, password_hash, google_sub, microsoft_oid"
-    )
+    .select(PROFILE_SELECT)
     .ilike("email", email)
     .maybeSingle();
 
@@ -173,9 +185,7 @@ async function findProfileByGoogleSub(sub: string): Promise<ProfileRow | null> {
   const supabase = getSupabaseSecret();
   const { data, error } = await supabase
     .from("profiles")
-    .select(
-      "id, email, phone, name, role, password_hash, google_sub, microsoft_oid"
-    )
+    .select(PROFILE_SELECT)
     .eq("google_sub", sub)
     .maybeSingle();
 
@@ -189,9 +199,7 @@ async function findProfileByMicrosoftOid(
   const supabase = getSupabaseSecret();
   const { data, error } = await supabase
     .from("profiles")
-    .select(
-      "id, email, phone, name, role, password_hash, google_sub, microsoft_oid"
-    )
+    .select(PROFILE_SELECT)
     .eq("microsoft_oid", oid)
     .maybeSingle();
 
@@ -203,13 +211,14 @@ async function createProfile(params: {
   email?: string | null;
   phone?: string | null;
   name?: string | null;
+  city?: string | null;
   role: UserRole;
   passwordHash?: string | null;
   googleSub?: string | null;
   microsoftOid?: string | null;
+  emailVerifiedAt?: string | null;
 }): Promise<ProfileRow> {
   const supabase = getSupabaseSecret();
-  const now = new Date().toISOString();
   const { data, error } = await supabase
     .from("profiles")
     .insert({
@@ -217,15 +226,13 @@ async function createProfile(params: {
       phone: params.phone ?? null,
       name: params.name ?? null,
       role: params.role,
-      city: "Lahore",
+      city: params.city ?? "Lahore",
       password_hash: params.passwordHash ?? null,
       google_sub: params.googleSub ?? null,
       microsoft_oid: params.microsoftOid ?? null,
-      email_verified_at: now,
+      email_verified_at: params.emailVerifiedAt ?? null,
     })
-    .select(
-      "id, email, phone, name, role, password_hash, google_sub, microsoft_oid"
-    )
+    .select(PROFILE_SELECT)
     .single();
 
   if (error || !data) {
@@ -248,15 +255,34 @@ async function linkOAuthToProfile(
     .from("profiles")
     .update({ ...patch, updated_at: new Date().toISOString() })
     .eq("id", profileId)
-    .select(
-      "id, email, phone, name, role, password_hash, google_sub, microsoft_oid"
-    )
+    .select(PROFILE_SELECT)
     .single();
 
   if (error || !data) {
     throw new ApiError(500, error?.message ?? "Profile update failed", "DB_ERROR");
   }
   return data as ProfileRow;
+}
+
+async function storeAndSendVerificationCode(email: string): Promise<void> {
+  const code = generateEmailCode();
+  const codeHash = await bcrypt.hash(code, 10);
+  const expiresAt = new Date();
+  expiresAt.setMinutes(expiresAt.getMinutes() + 15);
+
+  const supabase = getSupabaseSecret();
+  const { error } = await supabase.from("email_verification_codes").insert({
+    email,
+    code_hash: codeHash,
+    expires_at: expiresAt.toISOString(),
+  });
+
+  if (error) {
+    throw new ApiError(500, error.message, "DB_ERROR");
+  }
+
+  const { sendEmailVerificationCode } = await import("./email.service");
+  await sendEmailVerificationCode(email, code);
 }
 
 export async function signInWithPassword(
@@ -274,6 +300,14 @@ export async function signInWithPassword(
     throw new ApiError(401, "Invalid credentials", "AUTH_FAILED");
   }
 
+  if (!profile.email_verified_at) {
+    throw new ApiError(
+      403,
+      "Please verify your email before signing in",
+      "EMAIL_NOT_VERIFIED"
+    );
+  }
+
   return issueSession(mapProfile(profile), userAgent);
 }
 
@@ -281,8 +315,8 @@ export async function signUp(
   email: string,
   password: string,
   role: UserRole = "customer",
-  userAgent?: string
-): Promise<AuthSessionResponse> {
+  options?: { name?: string; city?: string; userAgent?: string }
+): Promise<AuthSignupPendingResponse> {
   const normalized = email.trim().toLowerCase();
   const existing = await findProfileByEmail(normalized);
   if (existing) {
@@ -290,13 +324,92 @@ export async function signUp(
   }
 
   const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-  const profile = await createProfile({
+  await createProfile({
     email: normalized,
     role,
     passwordHash,
+    name: options?.name ?? null,
+    city: options?.city ?? "Lahore",
+    emailVerifiedAt: null,
   });
 
-  return issueSession(mapProfile(profile), userAgent);
+  await storeAndSendVerificationCode(normalized);
+
+  return { requiresEmailVerification: true, email: normalized };
+}
+
+export async function resendVerificationCode(
+  email: string
+): Promise<{ sent: true }> {
+  const normalized = email.trim().toLowerCase();
+  const profile = await findProfileByEmail(normalized);
+
+  // Anti-enumeration: always succeed from the client's perspective
+  if (!profile || profile.email_verified_at) {
+    return { sent: true };
+  }
+
+  await storeAndSendVerificationCode(normalized);
+  return { sent: true };
+}
+
+export async function verifyEmail(
+  email: string,
+  code: string
+): Promise<AuthSessionResponse> {
+  const supabase = getSupabaseSecret();
+  const emailLower = email.trim().toLowerCase();
+  const now = new Date().toISOString();
+
+  const { data: codes, error } = await supabase
+    .from("email_verification_codes")
+    .select("id, code_hash, expires_at")
+    .eq("email", emailLower)
+    .is("used_at", null)
+    .gt("expires_at", now)
+    .order("created_at", { ascending: false })
+    .limit(5);
+
+  if (error) {
+    throw new ApiError(500, error.message, "DB_ERROR");
+  }
+
+  if (!codes || codes.length === 0) {
+    throw new ApiError(400, "Invalid or expired verification code", "VALIDATION_ERROR");
+  }
+
+  let matchedId: string | null = null;
+  for (const row of codes) {
+    if (await bcrypt.compare(code.toUpperCase(), (row as { code_hash: string }).code_hash)) {
+      matchedId = (row as { id: string }).id;
+      break;
+    }
+  }
+
+  if (!matchedId) {
+    throw new ApiError(400, "Invalid or expired verification code", "VALIDATION_ERROR");
+  }
+
+  await supabase
+    .from("email_verification_codes")
+    .update({ used_at: now })
+    .eq("id", matchedId);
+
+  const { error: updateError } = await supabase
+    .from("profiles")
+    .update({ email_verified_at: now, updated_at: now })
+    .eq("email", emailLower);
+
+  if (updateError) {
+    throw new ApiError(500, updateError.message, "DB_ERROR");
+  }
+
+  const profile = await findProfileByEmail(emailLower);
+  if (!profile) {
+    throw new ApiError(400, "User not found", "VALIDATION_ERROR");
+  }
+
+  return issueSession(mapProfile(profile));
 }
 
 export async function signInWithGoogle(
@@ -342,6 +455,7 @@ export async function signInWithGoogle(
       name: payload.name ?? null,
       role: "customer",
       googleSub: payload.sub,
+      emailVerifiedAt: new Date().toISOString(),
     });
   }
 
@@ -403,6 +517,7 @@ export async function signInWithMicrosoftCode(
       name: me.displayName ?? null,
       role: "customer",
       microsoftOid: oid,
+      emailVerifiedAt: new Date().toISOString(),
     });
   }
 
@@ -454,9 +569,7 @@ export async function refreshSession(
 
   const { data: profile, error: profileError } = await supabase
     .from("profiles")
-    .select(
-      "id, email, phone, name, role, password_hash, google_sub, microsoft_oid"
-    )
+    .select(PROFILE_SELECT)
     .eq("id", matched.user_id)
     .single();
 
@@ -522,19 +635,129 @@ export async function getSessionUser(accessToken: string): Promise<Authenticated
   };
 }
 
-/** @deprecated Phone auth deferred */
-export async function signUpWithPhone(): Promise<never> {
-  throw new ApiError(501, "Phone registration is not available yet", "NOT_IMPLEMENTED");
+export async function forgotPassword(
+  email: string
+): Promise<{ sent: boolean }> {
+  const supabase = getSupabaseSecret();
+  const emailLower = email.trim().toLowerCase();
+
+  const profile = await findProfileByEmail(emailLower);
+  if (!profile) {
+    return { sent: true };
+  }
+
+  const code = generateEmailCode();
+  const tokenHash = await bcrypt.hash(code, 10);
+  const expiresAt = new Date();
+  expiresAt.setMinutes(expiresAt.getMinutes() + 15);
+
+  const { error } = await supabase.from("password_reset_tokens").insert({
+    email: emailLower,
+    token_hash: tokenHash,
+    expires_at: expiresAt.toISOString(),
+  });
+
+  if (error) {
+    throw new ApiError(500, error.message, "DB_ERROR");
+  }
+
+  const { sendPasswordResetCode } = await import("./email.service");
+  await sendPasswordResetCode(emailLower, code);
+
+  return { sent: true };
 }
 
-export async function signInWithPhone(): Promise<never> {
-  throw new ApiError(501, "Phone login is not available yet", "NOT_IMPLEMENTED");
+export async function verifyResetCode(
+  email: string,
+  code: string
+): Promise<{ resetToken: string }> {
+  const supabase = getSupabaseSecret();
+  const emailLower = email.trim().toLowerCase();
+  const now = new Date().toISOString();
+
+  const { data: tokens, error } = await supabase
+    .from("password_reset_tokens")
+    .select("id, token_hash, expires_at")
+    .eq("email", emailLower)
+    .is("used_at", null)
+    .gt("expires_at", now)
+    .order("created_at", { ascending: false })
+    .limit(5);
+
+  if (error) {
+    throw new ApiError(500, error.message, "DB_ERROR");
+  }
+
+  if (!tokens || tokens.length === 0) {
+    throw new ApiError(400, "Invalid or expired reset code", "VALIDATION_ERROR");
+  }
+
+  let matchedId: string | null = null;
+  for (const row of tokens) {
+    if (await bcrypt.compare(code.toUpperCase(), (row as { token_hash: string }).token_hash)) {
+      matchedId = (row as { id: string }).id;
+      break;
+    }
+  }
+
+  if (!matchedId) {
+    throw new ApiError(400, "Invalid or expired reset code", "VALIDATION_ERROR");
+  }
+
+  await supabase
+    .from("password_reset_tokens")
+    .update({ used_at: now })
+    .eq("id", matchedId);
+
+  const env = getAuthEnv();
+  const profile = await findProfileByEmail(emailLower);
+  if (!profile) {
+    throw new ApiError(400, "User not found", "VALIDATION_ERROR");
+  }
+
+  const resetToken = jwt.sign(
+    { sub: profile.id, email: emailLower, purpose: "password_reset" },
+    env.jwtAccessSecret,
+    { expiresIn: "5m" }
+  );
+
+  return { resetToken };
 }
 
-export async function verifyEmailOTP(): Promise<never> {
-  throw new ApiError(501, "Email OTP verification is not available yet", "NOT_IMPLEMENTED");
+export async function resetPassword(
+  resetToken: string,
+  newPassword: string
+): Promise<{ success: boolean }> {
+  const env = getAuthEnv();
+  let payload: jwt.JwtPayload;
+  try {
+    payload = jwt.verify(resetToken, env.jwtAccessSecret) as jwt.JwtPayload;
+  } catch {
+    throw new ApiError(400, "Invalid or expired reset token", "VALIDATION_ERROR");
+  }
+
+  if (payload.purpose !== "password_reset" || !payload.sub) {
+    throw new ApiError(400, "Invalid reset token", "VALIDATION_ERROR");
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+  const supabase = getSupabaseSecret();
+
+  const { error: updateError } = await supabase
+    .from("profiles")
+    .update({ password_hash: passwordHash, updated_at: new Date().toISOString() })
+    .eq("id", payload.sub);
+
+  if (updateError) {
+    throw new ApiError(500, updateError.message, "DB_ERROR");
+  }
+
+  await supabase
+    .from("refresh_sessions")
+    .update({ revoked_at: new Date().toISOString() })
+    .eq("user_id", payload.sub)
+    .is("revoked_at", null);
+
+  return { success: true };
 }
 
-export async function verifyPhoneOTP(): Promise<never> {
-  throw new ApiError(501, "Phone OTP verification is not available yet", "NOT_IMPLEMENTED");
-}

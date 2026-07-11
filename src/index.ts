@@ -13,6 +13,10 @@ import { isSafepayConfigured } from "./config/safepay";
 const app = express();
 const PORT = Number(process.env.PORT) || 5000;
 
+// ngrok / reverse proxies set X-Forwarded-For. Required for express-rate-limit
+// (ERR_ERL_UNEXPECTED_X_FORWARDED_FOR when trust proxy is false).
+app.set("trust proxy", 1);
+
 const allowedOrigins = (
   process.env.CORS_ORIGINS ??
   "http://localhost:5173,http://localhost:8081,http://localhost:19006"
