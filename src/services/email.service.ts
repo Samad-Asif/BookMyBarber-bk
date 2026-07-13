@@ -84,6 +84,33 @@ export async function sendPasswordResetCode(
   });
 }
 
+export async function sendAccountLockedEmail(email: string): Promise<void> {
+  return sendEmail({
+    to: email,
+    subject: "Your BookMyBarber account has been locked",
+    html: `
+      <!DOCTYPE html>
+      <html>
+        <head><meta charset="utf-8"></head>
+        <body style="font-family: Inter, Arial, sans-serif; background: #FBFAF9; padding: 32px;">
+          <div style="max-width: 480px; margin: 0 auto; background: #FFFFFF; border-radius: 16px; border: 1px solid #E5E0DC; padding: 32px;">
+            <h1 style="font-family: 'Playfair Display', serif; color: #E77423; font-size: 28px; margin: 0 0 8px;">Account Locked</h1>
+            <p style="color: #14181F; font-size: 15px; line-height: 1.5; margin: 0 0 20px;">
+              Your BookMyBarber account has been temporarily locked for 24 hours due to too many verification attempts.
+            </p>
+            <p style="color: #14181F; font-size: 15px; line-height: 1.5; margin: 0 0 20px;">
+              You will be able to try again after the lock period expires.
+            </p>
+            <p style="color: #676F7E; font-size: 13px; line-height: 1.4; margin: 0;">
+              If you did not make these attempts, please contact support.
+            </p>
+          </div>
+        </body>
+      </html>
+    `,
+  });
+}
+
 export async function sendEmailVerificationCode(
   email: string,
   code: string

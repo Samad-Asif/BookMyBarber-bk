@@ -36,6 +36,7 @@ export interface AuthSessionResponse {
 export interface AuthSignupPendingResponse {
   requiresEmailVerification: true;
   email: string;
+  isExisting?: boolean;
 }
 
 interface ProfileRow {
@@ -301,6 +302,10 @@ export async function signInWithPassword(
   }
 
   if (!profile.email_verified_at) {
+    const { checkAccountLocked, trackOtpSend } = await import("./auth-lock.service");
+    await checkAccountLocked(profile.email ?? email);
+    await trackOtpSend(profile.email ?? email);
+    await storeAndSendVerificationCode(profile.email ?? email);
     throw new ApiError(
       403,
       "Please verify your email before signing in",
@@ -320,7 +325,14 @@ export async function signUp(
   const normalized = email.trim().toLowerCase();
   const existing = await findProfileByEmail(normalized);
   if (existing) {
-    throw new ApiError(400, "Email already registered", "SIGNUP_FAILED");
+    if (existing.email_verified_at) {
+      throw new ApiError(400, "Email already registered", "SIGNUP_FAILED");
+    }
+    const { checkAccountLocked, trackOtpSend } = await import("./auth-lock.service");
+    await checkAccountLocked(normalized);
+    await trackOtpSend(normalized);
+    await storeAndSendVerificationCode(normalized);
+    return { requiresEmailVerification: true, email: normalized, isExisting: true };
   }
 
   const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
@@ -349,6 +361,10 @@ export async function resendVerificationCode(
     return { sent: true };
   }
 
+  const { checkAccountLocked, trackOtpSend } = await import("./auth-lock.service");
+  await checkAccountLocked(normalized);
+  await trackOtpSend(normalized);
+
   await storeAndSendVerificationCode(normalized);
   return { sent: true };
 }
@@ -357,9 +373,12 @@ export async function verifyEmail(
   email: string,
   code: string
 ): Promise<AuthSessionResponse> {
+  const { checkAccountLocked, trackFailedVerify } = await import("./auth-lock.service");
   const supabase = getSupabaseSecret();
   const emailLower = email.trim().toLowerCase();
   const now = new Date().toISOString();
+
+  await checkAccountLocked(emailLower);
 
   const { data: codes, error } = await supabase
     .from("email_verification_codes")
@@ -375,6 +394,7 @@ export async function verifyEmail(
   }
 
   if (!codes || codes.length === 0) {
+    await trackFailedVerify(emailLower);
     throw new ApiError(400, "Invalid or expired verification code", "VALIDATION_ERROR");
   }
 
@@ -387,6 +407,7 @@ export async function verifyEmail(
   }
 
   if (!matchedId) {
+    await trackFailedVerify(emailLower);
     throw new ApiError(400, "Invalid or expired verification code", "VALIDATION_ERROR");
   }
 

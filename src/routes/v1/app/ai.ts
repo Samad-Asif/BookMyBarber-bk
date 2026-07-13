@@ -6,8 +6,8 @@ import { ApiError } from "../../../lib/errors";
 import {
   analyzeHaircutPortraits,
   isGeminiConfigured,
-  uploadPortrait,
 } from "../../../services/gemini.service";
+import { uploadImage } from "../../../services/cloudinary.service";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 const router = Router();
@@ -31,13 +31,8 @@ router.post(
     const urls: string[] = [];
 
     for (let i = 0; i < 3; i++) {
-      const url = await uploadPortrait(
-        req.user!.id,
-        files[i].buffer,
-        files[i].mimetype,
-        i
-      );
-      urls.push(url);
+      const result = await uploadImage(files[i].buffer, files[i].mimetype, "haircut-portraits");
+      urls.push(result.secureUrl);
     }
 
     const analysis = await analyzeHaircutPortraits({

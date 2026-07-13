@@ -46,3 +46,14 @@ export const adminBookingsQuerySchema = z.object({
   to: z.string().regex(dateRegex).optional(),
   limit: z.coerce.number().int().min(1).max(200).optional(),
 });
+
+export const customerBookingsQuerySchema = z.object({
+  status: z.string().optional(),
+  paymentStatus: z
+    .enum(["unpaid", "paid", "refunded"])
+    .optional(),
+  from: z.string().regex(dateRegex).optional(),
+  to: z.string().regex(dateRegex).optional(),
+});
+
+export type CustomerBookingsQuery = z.infer<typeof customerBookingsQuerySchema>;

@@ -8,6 +8,7 @@ import { param } from "../../../lib/params";
 import {
   approveBookingBodySchema,
   createBookingBodySchema,
+  customerBookingsQuerySchema,
   rejectBookingBodySchema,
 } from "../../../schemas/booking";
 import {
@@ -44,7 +45,20 @@ router.get(
   authenticate,
   authorize("customer"),
   asyncHandler(async (req: Request, res: Response) => {
-    const bookings = await listCustomerBookings(req.user!.id);
+    const parsed = customerBookingsQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      const message = parsed.error.issues.map((i) => i.message).join("; ");
+      throw new ApiError(400, message, "VALIDATION_ERROR");
+    }
+    const { status, paymentStatus, from, to } = parsed.data;
+    const bookings = await listCustomerBookings(req.user!.id, {
+      status: status
+        ? status.split(",").map((s) => s.trim()).filter(Boolean)
+        : undefined,
+      paymentStatus,
+      from,
+      to,
+    });
     res.json({ bookings });
   })
 );

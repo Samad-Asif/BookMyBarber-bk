@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { getSupabaseSecret } from "../config/supabase";
+// ponytail: uploadPortrait() removed — Supabase Storage replaced by Cloudinary service
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
 
@@ -114,25 +115,3 @@ export async function generateChatAiReply(
   return result.response.text().trim();
 }
 
-export async function uploadPortrait(
-  userId: string,
-  fileBuffer: Buffer,
-  mimeType: string,
-  index: number
-): Promise<string> {
-  const supabase = getSupabaseSecret();
-  const ext = mimeType.includes("png") ? "png" : "jpg";
-  const path = `${userId}/${Date.now()}_${index}.${ext}`;
-
-  const { error } = await supabase.storage
-    .from("haircut-portraits")
-    .upload(path, fileBuffer, { contentType: mimeType, upsert: true });
-
-  if (error) throw new Error(error.message);
-
-  const { data: signed } = await supabase.storage
-    .from("haircut-portraits")
-    .createSignedUrl(path, 3600);
-
-  return signed?.signedUrl ?? path;
-}

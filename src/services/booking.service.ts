@@ -255,9 +255,17 @@ export async function updateBookingPaymentStatus(
     .eq("id", bookingId);
 }
 
-export async function listCustomerBookings(customerId: string) {
+export async function listCustomerBookings(
+  customerId: string,
+  options?: {
+    status?: string[];
+    paymentStatus?: string;
+    from?: string;
+    to?: string;
+  }
+) {
   const supabase = getSupabaseSecret();
-  const { data, error } = await supabase
+  let query = supabase
     .from("bookings")
     .select(
       `*, shop_services(name), barber_shops(name, city, address, latitude, longitude), workers(name)`
@@ -265,6 +273,20 @@ export async function listCustomerBookings(customerId: string) {
     .eq("customer_id", customerId)
     .order("booking_date", { ascending: false });
 
+  if (options?.status?.length) {
+    query = query.in("status", options.status);
+  }
+  if (options?.paymentStatus) {
+    query = query.eq("payment_status", options.paymentStatus);
+  }
+  if (options?.from) {
+    query = query.gte("booking_date", options.from);
+  }
+  if (options?.to) {
+    query = query.lte("booking_date", options.to);
+  }
+
+  const { data, error } = await query;
   if (error) throw new ApiError(500, error.message, "DB_ERROR");
   return data ?? [];
 }
