@@ -56,6 +56,13 @@ export async function deleteImage(publicId: string): Promise<void> {
   });
 }
 
+export async function deleteImageByUrl(url: string): Promise<void> {
+  // Extract public_id from Cloudinary URL: .../v1234/folder/file.jpg → folder/file.jpg
+  const match = url.match(/\/v\d+\/(.+)\.\w+$/);
+  if (!match) return;
+  await deleteImage(match[1]);
+}
+
 export function getOptimizedUrl(publicId: string, options?: TransformOptions): string {
   const cloudinary = getCloudinary();
   const transforms: string[] = ["f_auto", "q_auto"];

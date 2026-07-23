@@ -9,6 +9,7 @@ import { errorHandler } from "./middleware/errorHandler";
 import { logger } from "./config/logger";
 import { getSupabaseConfig, isSupabaseConfigured } from "./config/supabase";
 import { isSafepayConfigured } from "./config/safepay";
+import { startHaircutQueue } from "./services/haircut-queue.service";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -98,4 +99,7 @@ app.listen(PORT, "0.0.0.0", () => {
     secret: sb.secretKey ? sb.keySources.secret : "missing",
   });
   logger.info("SafePay", { configured: isSafepayConfigured() });
+
+  // Start haircut generation queue worker (polls for pending jobs)
+  startHaircutQueue();
 });
