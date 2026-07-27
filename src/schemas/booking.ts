@@ -37,6 +37,22 @@ export const slotsQuerySchema = z.object({
   durationMinutes: z.coerce.number().int().positive().optional(),
 });
 
+export const batchBookingItemSchema = z.object({
+  serviceId: z.string().uuid(),
+  workerId: z.string().uuid().optional(),
+  startTime: z.string().regex(timeRegex, "startTime must be HH:MM or HH:MM:SS"),
+});
+
+export const batchBookingBodySchema = z.object({
+  shopId: z.string().uuid(),
+  bookingDate: z.string().regex(dateRegex, "bookingDate must be YYYY-MM-DD"),
+  customerNotes: z.string().trim().max(2000).optional(),
+  items: z.array(batchBookingItemSchema).min(1).max(10),
+});
+
+export type BatchBookingItem = z.infer<typeof batchBookingItemSchema>;
+export type BatchBookingBody = z.infer<typeof batchBookingBodySchema>;
+
 export const adminBookingsQuerySchema = z.object({
   status: z
     .enum(["pending", "approved", "rejected", "completed", "cancelled"])
@@ -55,5 +71,17 @@ export const customerBookingsQuerySchema = z.object({
   from: z.string().regex(dateRegex).optional(),
   to: z.string().regex(dateRegex).optional(),
 });
+
+export const multiSlotsItemSchema = z.object({
+  serviceId: z.string().uuid(),
+  workerId: z.string().uuid().optional(),
+});
+
+export const multiSlotsBodySchema = z.object({
+  date: z.string().regex(dateRegex, "date must be YYYY-MM-DD"),
+  items: z.array(multiSlotsItemSchema).min(1).max(10),
+});
+
+export type MultiSlotsBody = z.infer<typeof multiSlotsBodySchema>;
 
 export type CustomerBookingsQuery = z.infer<typeof customerBookingsQuerySchema>;

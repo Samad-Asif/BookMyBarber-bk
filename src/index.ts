@@ -10,6 +10,7 @@ import { logger } from "./config/logger";
 import { getSupabaseConfig, isSupabaseConfigured } from "./config/supabase";
 import { isSafepayConfigured } from "./config/safepay";
 import { startHaircutQueue } from "./services/haircut-queue.service";
+import { startUnpaidBookingExpirySweep } from "./services/booking-expiry.service";
 
 const app = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -102,4 +103,6 @@ app.listen(PORT, "0.0.0.0", () => {
 
   // Start haircut generation queue worker (polls for pending jobs)
   startHaircutQueue();
+  // Auto-cancel unpaid bookings past payment_due_at
+  startUnpaidBookingExpirySweep();
 });

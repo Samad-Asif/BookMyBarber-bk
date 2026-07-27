@@ -1,17 +1,28 @@
 import { GoogleGenAI, createPartFromBase64 } from "@google/genai";
+import sharp from "sharp";
 import { getSupabaseSecret } from "../config/supabase";
 import { ApiError } from "../lib/errors";
 import { uploadImage } from "./cloudinary.service";
-import { runWithProviderFallback, runWithFallbackAndValidation, hasFallbackProviders } from "./ai-providers";
+
+// ── configuration ───────────────────────────────────────────────────
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
-const IMAGE_GEN_MODEL = "gemini-2.5-flash-image";
 
-const FALLBACK_MODELS = [
-    "gemini-2.0-flash",
-    "gemini-flash-latest",
-    "gemini-2.0-flash-lite",
+/** Single-step pipeline models — image+text in, image+text out (free tier) */
+const PIPELINE_MODELS = [
+    "gemini-3.1-flash-image",   // primary, ~10 RPM / ~500 RPD free tier
+    "gemini-2.5-flash-image",   // fallback, same free tier pool
 ];
+
+/** Text-only chat models */
+const CHAT_MODELS = ["gemini-3.5-flash", "gemini-3.6-flash"];
+
+const MAX_RETRIES_PER_MODEL = 3;
+const BASE_DELAY_MS = 1_000;
+const INPUT_MAX_SIZE_PX = 1024;
+const INPUT_JPEG_QUALITY = 80;
+
+// ── client ──────────────────────────────────────────────────────────
 
 let client: GoogleGenAI | null = null;
 
@@ -26,60 +37,50 @@ export function isGeminiConfigured(): boolean {
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-interface FetchedImage {
-    base64: string;
-    mimeType: string;
-    geminiPart: any;
+function sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
 }
 
-async function fetchImages(urls: string[]): Promise<FetchedImage[]> {
-    return Promise.all(
-        urls.map(async (url) => {
-            const res = await fetch(url);
-            const buf = Buffer.from(await res.arrayBuffer());
-            const mimeType = res.headers.get("content-type") ?? "image/jpeg";
-            const base64 = buf.toString("base64");
-            return {
-                base64,
-                mimeType,
-                geminiPart: createPartFromBase64(base64, mimeType),
-            };
-        }),
-    );
+function backoff(attempt: number): number {
+    const delay = Math.min(60_000, BASE_DELAY_MS * Math.pow(2, attempt));
+    const jitter = Math.random() * 1_000;
+    return delay + jitter;
 }
 
-function toGeminiParts(images: FetchedImage[]) {
-    return images.map((img) => img.geminiPart);
+interface RateLimitInfo {
+    rateLimited: boolean;
+    retryAfterMs: number | null;
+    isDailyQuota: boolean;
 }
 
-function toProviderImages(images: FetchedImage[]) {
-    return images.map((img) => ({ data: img.base64, mimeType: img.mimeType }));
-}
+function parseRateLimitInfo(err: any): RateLimitInfo {
+    const status = err?.status ?? err?.code;
+    const msg = err?.message ?? String(err);
 
-function extractJson(text: string) {
-    const m = text.match(/\{[\s\S]*\}/);
-    return JSON.parse(m?.[0] ?? text);
-}
+    const is429 = status === 429 ||
+        msg.includes("429") ||
+        msg.includes("RESOURCE_EXHAUSTED") ||
+        msg.includes("Quota exceeded") ||
+        msg.includes("exceeded your current quota");
 
-function extractGeneratedImage(response: any): Buffer | null {
-    const candidates = response.candidates;
-    if (!candidates?.length) {
-        console.warn("[gemini] no candidates in image gen response");
-        return null;
+    if (!is429) {
+        return { rateLimited: false, retryAfterMs: null, isDailyQuota: false };
     }
-    const parts = candidates[0].content?.parts;
-    if (!parts?.length) {
-        console.warn("[gemini] no parts in image gen response");
-        return null;
-    }
-    for (const part of parts) {
-        const data = part.inlineData?.data ?? part.inline_data?.data;
-        if (data) {
-            return Buffer.from(data, "base64");
-        }
-    }
-    console.warn("[gemini] no inline image data found in parts:", parts.map((p: any) => Object.keys(p)));
-    return null;
+
+    // Parse retryDelay from Google's response: "Please retry in 14.504299337s"
+    const retryMatch = msg.match(/Please retry in (\d+(?:\.\d+)?)s/);
+    const retryAfterMs = retryMatch ? parseFloat(retryMatch[1]) * 1000 : null;
+
+    // Daily quota exhaustion = no retryDelay OR retryDelay > 60s
+    // Per-minute rate limit = retryDelay < 60s (Google tells us exactly when to retry)
+    const hasShortRetry = retryAfterMs !== null && retryAfterMs < 60_000;
+    const isDailyQuota = !hasShortRetry;
+
+    return { rateLimited: true, retryAfterMs, isDailyQuota };
+}
+
+function isRateLimited(err: any): boolean {
+    return parseRateLimitInfo(err).rateLimited;
 }
 
 function throwGeminiError(err: any): never {
@@ -120,186 +121,533 @@ function throwGeminiError(err: any): never {
     throw new ApiError(502, `AI error: ${shortMsg}`, "AI_UNAVAILABLE");
 }
 
-// ── retry + model fallback ──────────────────────────────────────────
-
-function isRateLimited(err: any): boolean {
-    const status = err?.status ?? err?.code;
-    if (status === 429) return true;
-    const msg = (err as any)?.rawMessage ?? err?.message ?? String(err);
-    return msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("Quota exceeded") || msg.includes("exceeded your current quota") || msg.includes("limit: 0");
+function extractJson(text: string) {
+    const m = text.match(/\{[\s\S]*\}/);
+    return JSON.parse(m?.[0] ?? text);
 }
 
-async function withGeminiModelChain<T>(
+function extractGeneratedImage(response: any): Buffer | null {
+    const candidates = response.candidates;
+    if (!candidates?.length) {
+        console.warn("[gemini] no candidates in response");
+        return null;
+    }
+    const parts = candidates[0].content?.parts;
+    if (!parts?.length) {
+        console.warn("[gemini] no parts in response");
+        return null;
+    }
+    for (const part of parts) {
+        const data = part.inlineData?.data ?? part.inline_data?.data;
+        if (data) {
+            return Buffer.from(data, "base64");
+        }
+    }
+    console.warn("[gemini] no inline image data found in parts:", parts.map((p: any) => Object.keys(p)));
+    return null;
+}
+
+function extractBothFromResponse(response: any): { text: string; imageBuffer: Buffer | null } {
+    const candidates = response.candidates;
+    let text = "";
+    let imageBuffer: Buffer | null = null;
+
+    if (candidates?.length) {
+        const parts = candidates[0].content?.parts;
+        if (parts?.length) {
+            const textParts: string[] = [];
+            for (const part of parts) {
+                if (part.text) {
+                    textParts.push(part.text);
+                }
+                const data = part.inlineData?.data ?? part.inline_data?.data;
+                if (data && !imageBuffer) {
+                    imageBuffer = Buffer.from(data, "base64");
+                }
+            }
+            text = textParts.join("\n");
+        }
+    }
+
+    // Fallback to SDK getters
+    if (!text) text = response.text ?? "";
+
+    return { text, imageBuffer };
+}
+
+// ── image compression ───────────────────────────────────────────────
+
+interface FetchedImage {
+    base64: string;
+    mimeType: string;
+    geminiPart: any;
+}
+
+async function compressImage(buf: Buffer): Promise<Buffer> {
+    try {
+        const meta = await sharp(buf).metadata();
+        if (!meta.width || !meta.height) return buf;
+        if (meta.width <= INPUT_MAX_SIZE_PX && meta.height <= INPUT_MAX_SIZE_PX) {
+            return Buffer.from(await sharp(buf).jpeg({ quality: INPUT_JPEG_QUALITY }).toBuffer());
+        }
+        return Buffer.from(
+            await sharp(buf)
+                .resize(INPUT_MAX_SIZE_PX, INPUT_MAX_SIZE_PX, { fit: "inside", withoutEnlargement: true })
+                .jpeg({ quality: INPUT_JPEG_QUALITY })
+                .toBuffer(),
+        );
+    } catch {
+        return buf;
+    }
+}
+
+async function fetchImages(urls: string[]): Promise<FetchedImage[]> {
+    return Promise.all(
+        urls.map(async (url) => {
+            const res = await fetch(url);
+            let buf: Buffer = Buffer.from(await res.arrayBuffer());
+            buf = await compressImage(buf);
+            const base64 = buf.toString("base64");
+            return {
+                base64,
+                mimeType: "image/jpeg",
+                geminiPart: createPartFromBase64(base64, "image/jpeg"),
+            };
+        }),
+    );
+}
+
+function toGeminiParts(images: FetchedImage[]) {
+    return images.map((img) => img.geminiPart);
+}
+
+// ── model cascade with retry + Google-informed backoff ───────────────
+
+interface ChainResult<T> {
+    ok: true;
+    value: T;
+}
+
+interface ChainError {
+    ok: false;
+    lastErr: any;
+    dailyQuota: boolean;
+}
+
+async function withPipelineModelChain<T>(
     fn: (modelName: string) => Promise<T>,
     label: string,
 ): Promise<T> {
     let lastErr: any;
-    for (const modelName of FALLBACK_MODELS) {
-        try {
-            console.log(`[gemini] ${label} trying ${modelName}`);
-            return await fn(modelName);
-        } catch (err: any) {
-            lastErr = err;
-            if (isRateLimited(err)) {
-                console.warn(`[gemini] ${label} ${modelName} rate-limited — skipping to next`);
+    let dailyQuota = false;
+
+    for (const modelName of PIPELINE_MODELS) {
+        for (let attempt = 0; attempt < MAX_RETRIES_PER_MODEL; attempt++) {
+            try {
+                console.log(`[gemini] ${label} trying ${modelName} (attempt ${attempt + 1})`);
+                return await fn(modelName);
+            } catch (err: any) {
+                lastErr = err;
+                const info = parseRateLimitInfo(err);
+
+                if (!info.rateLimited) {
+                    throwGeminiError(err);
+                }
+
+                // Daily quota exhausted — stop retrying entirely
+                if (info.isDailyQuota) {
+                    console.warn(`[gemini] ${label} ${modelName} daily quota exhausted — no retry`);
+                    dailyQuota = true;
+                    break;
+                }
+
+                // Use Google's retry delay if provided and reasonable (< 60s),
+                // otherwise fall back to our own exponential backoff
+                const delay = (info.retryAfterMs && info.retryAfterMs < 60_000)
+                    ? info.retryAfterMs
+                    : backoff(attempt);
+
+                console.warn(`[gemini] ${label} ${modelName} rate-limited — retry in ${Math.round(delay)}ms${info.retryAfterMs ? ` (google: ${info.retryAfterMs}ms)` : ""}`);
+                await sleep(delay);
                 continue;
             }
-            throw err;
         }
+        if (dailyQuota) break;
+        console.warn(`[gemini] ${label} ${modelName} exhausted retries — trying next model`);
     }
+
+    // If daily quota is gone, throw immediately with clear message
+    if (dailyQuota) {
+        throw new ApiError(
+            429,
+            "AI daily usage limit has been reached. Please try again tomorrow.",
+            "DAILY_QUOTA_EXHAUSTED",
+        );
+    }
+
     throw lastErr ?? new ApiError(503, "All Gemini models are temporarily unavailable", "AI_UNAVAILABLE");
 }
 
-// ── Stage A: per-photo face validation ──────────────────────────────
+/**
+ * Same as withPipelineModelChain but returns error info instead of throwing.
+ * Used by the batch queue fallback path.
+ */
+async function withPipelineModelChainSafe<T>(
+    fn: (modelName: string) => Promise<T>,
+    label: string,
+): Promise<ChainResult<T> | ChainError> {
+    let lastErr: any;
+    let dailyQuota = false;
 
-interface PhotoValidation {
-    index: number;
-    valid: boolean;
-    reason?: string;
-}
+    for (const modelName of PIPELINE_MODELS) {
+        for (let attempt = 0; attempt < MAX_RETRIES_PER_MODEL; attempt++) {
+            try {
+                console.log(`[gemini] ${label} trying ${modelName} (attempt ${attempt + 1})`);
+                return { ok: true, value: await fn(modelName) };
+            } catch (err: any) {
+                lastErr = err;
+                const info = parseRateLimitInfo(err);
 
-interface ValidationResponse {
-    photos: PhotoValidation[];
-    all_same_person: boolean;
-    all_same_person_reason?: string;
-}
-
-const VALIDATE_PROMPT = `You are a photo validation expert. Evaluate each of these 3 portrait photos independently.
-
-Photo 1 = FRONT view (face facing camera)
-Photo 2 = LEFT SIDE view (head turned left)
-Photo 3 = RIGHT SIDE view (head turned right)
-
-For EACH photo, check ALL of these conditions:
-1. Contains exactly ONE clearly visible human face
-2. Face is well-lit (not too dark, not overexposed/blown out)
-3. Face is in sharp focus (not blurry, not motion-blurred)
-4. Face is not occluded (not behind sunglasses, mask, hat covering face, hand covering face, hair fully covering face)
-5. Face fills at least 15% of the image frame (not too far away)
-6. Photo is not a cartoon, illustration, painting, or AI-generated image
-7. Photo is not a screenshot, meme, or has text/watermarks covering the face
-
-After evaluating each photo, verify all 3 appear to be the same person (consistent skin tone, face structure, age range).
-
-Return ONLY this JSON (no markdown, no extra text):
-{
-  "photos": [
-    {"index": 0, "valid": true|false, "reason": "if invalid, specific reason"},
-    {"index": 1, "valid": true|false, "reason": "if invalid, specific reason"},
-    {"index": 2, "valid": true|false, "reason": "if invalid, specific reason"}
-  ],
-  "all_same_person": true|false,
-  "all_same_person_reason": "if false, explain why (e.g. 'different skin tones', 'different face structure', 'different age range')"
-}`;
-
-async function validatePhotos(
-    images: FetchedImage[],
-    modelName?: string,
-): Promise<ValidationResponse> {
-    if (isGeminiConfigured()) {
-        try {
-            const geminiParts = toGeminiParts(images);
-            const exec = async (model: string) => {
-                const ai = getClient();
-                try {
-                    const result = await ai.models.generateContent({
-                        model,
-                        contents: [{ role: "user", parts: [{ text: VALIDATE_PROMPT }, ...geminiParts] }],
-                    });
-                    const text = result.text ?? "";
-                    return extractJson(text);
-                } catch (err: any) {
-                    throwGeminiError(err);
+                if (!info.rateLimited) {
+                    return { ok: false, lastErr: err, dailyQuota: false };
                 }
-            };
 
-            if (modelName) return exec(modelName);
-            return await withGeminiModelChain(exec, "validatePhotos");
-        } catch (err: any) {
-            if (!hasFallbackProviders()) throw err;
-            console.warn("[gemini] validatePhotos failed, trying providers:", err?.message?.slice(0, 100));
+                if (info.isDailyQuota) {
+                    dailyQuota = true;
+                    break;
+                }
+
+                const delay = (info.retryAfterMs && info.retryAfterMs < 60_000)
+                    ? info.retryAfterMs
+                    : backoff(attempt);
+
+                console.warn(`[gemini] ${label} ${modelName} rate-limited — retry in ${Math.round(delay)}ms`);
+                await sleep(delay);
+                continue;
+            }
         }
+        if (dailyQuota) break;
     }
 
-    if (hasFallbackProviders()) {
-        const providerImages = toProviderImages(images);
-        const { text } = await runWithProviderFallback({ prompt: VALIDATE_PROMPT, images: providerImages });
-        return extractJson(text);
-    }
-
-    throw new ApiError(503, "No AI providers available", "NOT_CONFIGURED");
+    return { ok: false, lastErr, dailyQuota };
 }
 
-// ── Stage A: style analysis ─────────────────────────────────────────
+// ── in-memory batch queue (delayed retry fallback) ──────────────────
 
-const ANALYSIS_PROMPT_TEMPLATE = (customerPrompt?: string) => `You are a professional barber and hair stylist. Analyze these 3 portrait photos of the same person.
+interface BatchJob {
+    id: string;
+    images: FetchedImage[];
+    combinedPrompt: string;
+    attempts: number;
+    nextRetryAt: number;
+    googleRetryMs: number | null;
+    onComplete: (result: { text: string; imageBuffer: Buffer | null } | null) => void;
+}
+
+const batchQueue: BatchJob[] = [];
+const BATCH_POLL_MS = 15_000;
+const MAX_BATCH_ATTEMPTS = 10;
+let batchTimer: ReturnType<typeof setInterval> | null = null;
+
+function startBatchProcessor() {
+    if (batchTimer) return;
+    batchTimer = setInterval(() => {
+        const now = Date.now();
+        for (let i = batchQueue.length - 1; i >= 0; i--) {
+            const job = batchQueue[i];
+            if (job.nextRetryAt > now) continue;
+            if (job.attempts >= MAX_BATCH_ATTEMPTS) {
+                batchQueue.splice(i, 1);
+                job.onComplete(null);
+                continue;
+            }
+            job.attempts++;
+            // Use Google's retry delay if we have one, otherwise exponential backoff
+            const delay = job.googleRetryMs && job.googleRetryMs < 120_000
+                ? job.googleRetryMs
+                : backoff(job.attempts);
+            job.nextRetryAt = now + delay;
+            job.googleRetryMs = null; // consumed, will be re-set from next error if any
+
+            console.log(`[gemini] batch retry ${job.id} attempt ${job.attempts}/${MAX_BATCH_ATTEMPTS} in ${Math.round(delay)}ms`);
+
+            runSingleStepPipelineRaw(job.images, job.combinedPrompt)
+                .then((result) => {
+                    console.log(`[gemini] batch job ${job.id} succeeded`);
+                    job.onComplete(result);
+                    const idx = batchQueue.indexOf(job);
+                    if (idx !== -1) batchQueue.splice(idx, 1);
+                })
+                .catch((err: any) => {
+                    // Update googleRetryMs from the error for next batch attempt
+                    const info = parseRateLimitInfo(err);
+                    if (info.isDailyQuota) {
+                        console.warn(`[gemini] batch job ${job.id} daily quota exhausted — giving up`);
+                        batchQueue.splice(batchQueue.indexOf(job), 1);
+                        job.onComplete(null);
+                        return;
+                    }
+                    job.googleRetryMs = info.retryAfterMs;
+                });
+        }
+    }, BATCH_POLL_MS);
+}
+
+export function stopBatchProcessor() {
+    if (batchTimer) {
+        clearInterval(batchTimer);
+        batchTimer = null;
+    }
+}
+
+// ── Single-step pipeline: validation + analysis + image generation ───
+
+const COMBINED_PROMPT = (customerPrompt?: string) => `You are a professional barber and hair stylist AI. You will receive 3 portrait photos of the same person.
 
 Photo 1 = FRONT view (face facing camera)
 Photo 2 = LEFT SIDE view (head turned left)
 Photo 3 = RIGHT SIDE view (head turned right)
 
-Analyze and respond with ONLY this JSON (no markdown, no extra text):
-{
-  "face_shape": "oval|round|square|heart|oblong",
-  "hair_density": "thick|medium|thin|receding",
-  "hair_texture": "straight|wavy|curly|coily",
-  "hair_color": "description of natural hair color",
-  "suggested_haircut": "name of the haircut (e.g. 'Textured Crop with Mid Fade')",
-  "styling_reason": "2-3 sentences explaining why this haircut suits their face shape, hair type, and overall look",
-  "analysis_details": "1-2 sentences about face shape observations and hair characteristics",
-  "generation_prompt": "A highly detailed photorealistic prompt for an AI image generator. Describe the specific facial identity from the reference photos — face shape, skin undertone, eye shape and color, nose shape, lip fullness, jawline, brow thickness, distinguishing features. Then describe the exact haircut: fade height, length on top, texture, parting, edge work. CRITICAL: The image must show ONLY the haircut change — same face, same skin, same features, same expression. Do NOT alter facial features, skin tone, age, or identity. Include: studio lighting, solid blue-grey gradient background."
+## STEP 1: Validate each photo
+
+Check each photo for:
+- Exactly ONE clearly visible human face
+- Well-lit (not too dark, not overexposed)
+- Sharp focus (not blurry)
+- Not occluded (no sunglasses, mask, hat covering face)
+- Face fills at least 15% of the frame
+- Not a cartoon, illustration, or AI-generated
+- All 3 photos appear to be the same person
+
+## STEP 2: Analyze the person's hair and face
+
+Determine:
+- Face shape (oval, round, square, heart, or oblong)
+- Hair density (thick, medium, thin, or receding)
+- Hair texture (straight, wavy, curly, or coily)
+- Natural hair color
+- Suggest a modern, flattering haircut that suits their face shape and hair type
+
+## STEP 3: Generate the haircut image
+
+Using the person from the 3 reference photos, generate a single professional headshot showing them with the suggested haircut applied.
+
+CRITICAL — DO NOT CHANGE:
+- Face structure, shape, or proportions
+- Skin tone, complexion, or undertone
+- Eye shape, color, or expression
+- Nose, lips, jawline, or any facial feature
+- Age appearance
+- Ethnicity or racial features
+
+ONLY CHANGE THE HAIR:
+- Apply the suggested haircut to the person's HEAD hair AND/OR facial hair as specified
+- Keep everything else exactly the same as the reference photos
+
+Image requirements:
+- Background: Clean professional studio gradient (soft blue-grey)
+- Lighting: Even, flattering studio lighting
+- Expression: Natural, confident — same as reference photos
+- Resolution: High quality, photorealistic
+- The haircut must be clearly visible and well-defined
+- Do NOT stylize or cartoon-ify — this must look like a real photo
+- The person must look IDENTICAL to the reference photos except for the hair change
+
+Customer request: ${customerPrompt ?? "Suggest a modern flattering haircut"}
+
+## OUTPUT FORMAT
+
+You MUST respond with EXACTLY two parts in this order:
+1. FIRST: A JSON text block (no markdown, no code fences) with this exact structure:
+{"valid":true,"photos":[{"index":0,"valid":true,"reason":""},{"index":1,"valid":true,"reason":""},{"index":2,"valid":true,"reason":""}],"all_same_person":true,"all_same_person_reason":"","face_shape":"oval|round|square|heart|oblong","hair_density":"thick|medium|thin|receding","hair_texture":"straight|wavy|curly|coily","hair_color":"description","suggested_haircut":"haircut name","styling_reason":"2-3 sentences why this suits them","analysis_details":"1-2 sentences about face/hair observations","generation_prompt":"detailed prompt for the image"}
+
+2. SECOND: The generated headshot image showing the person with the new haircut.
+
+Both parts are mandatory. The JSON must come before the image.`;
+
+async function runSingleStepPipelineRaw(
+    images: FetchedImage[],
+    combinedPrompt: string,
+): Promise<{ text: string; imageBuffer: Buffer | null }> {
+    const geminiParts = toGeminiParts(images);
+
+    const result = await withPipelineModelChain(async (model) => {
+        const ai = getClient();
+        const response = await ai.models.generateContent({
+            model,
+            contents: [{ role: "user", parts: [{ text: combinedPrompt }, ...geminiParts] }],
+            config: {
+                responseModalities: ["TEXT", "IMAGE"],
+            },
+        });
+        return extractBothFromResponse(response);
+    }, "singleStepPipeline");
+
+    return result;
 }
 
-Customer request: ${customerPrompt ?? "Suggest a modern flattering haircut"}`;
-
-async function analyzeStyle(
-    images: FetchedImage[],
+/**
+ * Public wrapper — fetches images from URLs, runs single-step pipeline.
+ * Returns analysis JSON + generated image buffer.
+ * On rate limit failure, enqueues to batch queue for delayed retry.
+ */
+async function runSingleStepPipeline(
+    photoUrls: [string, string, string],
     customerPrompt?: string,
-    modelName?: string,
-) {
-    const prompt = ANALYSIS_PROMPT_TEMPLATE(customerPrompt);
+): Promise<{ analysis: AnalysisResult; imageBuffer: Buffer | null }> {
+    if (!isGeminiConfigured()) {
+        throw new ApiError(503, "Gemini AI is not configured", "NOT_CONFIGURED");
+    }
 
-    if (isGeminiConfigured()) {
-        try {
-            const geminiParts = toGeminiParts(images);
-            const exec = async (model: string) => {
-                const ai = getClient();
-                try {
-                    const result = await ai.models.generateContent({
-                        model,
-                        contents: [{ role: "user", parts: [{ text: prompt }, ...geminiParts] }],
-                    });
-                    const text = result.text ?? "";
-                    return extractJson(text);
-                } catch (err: any) {
-                    throwGeminiError(err);
-                }
+    const images = await fetchImages(photoUrls);
+    const prompt = COMBINED_PROMPT(customerPrompt);
+
+    // Try the pipeline — use Safe variant to catch rate limits for batch fallback
+    const safeResult = await withPipelineModelChainSafe(async (model) => {
+        const ai = getClient();
+        const response = await ai.models.generateContent({
+            model,
+            contents: [{ role: "user", parts: [{ text: prompt }, ...toGeminiParts(images)] }],
+            config: {
+                responseModalities: ["TEXT", "IMAGE"],
+            },
+        });
+        return extractBothFromResponse(response);
+    }, "singleStepPipeline");
+
+    if (safeResult.ok) {
+        let result = safeResult.value;
+
+        // If first attempt returned no image, retry once more
+        if (!result.imageBuffer && result.text) {
+            console.warn("[gemini] single-step returned text but no image — retrying");
+            result = await runSingleStepPipelineRaw(images, prompt);
+        }
+
+        return parseAnalysisResult(result);
+    }
+
+    // Pipeline failed — check if we should enqueue to batch queue
+    const err = safeResult.lastErr;
+    const info = parseRateLimitInfo(err);
+
+    if (info.isDailyQuota) {
+        // Daily quota exhausted — don't bother queueing, fail immediately
+        throw new ApiError(
+            429,
+            "AI daily usage limit has been reached. Please try again tomorrow.",
+            "DAILY_QUOTA_EXHAUSTED",
+        );
+    }
+
+    if (info.rateLimited) {
+        // Rate limited but not daily — enqueue to batch queue for delayed retry
+        console.warn(`[gemini] all models rate-limited — enqueuing to batch queue (googleRetryMs: ${info.retryAfterMs})`);
+        return new Promise((resolve, reject) => {
+            const job: BatchJob = {
+                id: `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                images,
+                combinedPrompt: prompt,
+                attempts: 0,
+                nextRetryAt: Date.now() + (info.retryAfterMs ?? 30_000),
+                googleRetryMs: info.retryAfterMs,
+                onComplete: (result) => {
+                    if (!result) {
+                        reject(new ApiError(503, "AI service is temporarily busy. Please try again later.", "AI_UNAVAILABLE"));
+                        return;
+                    }
+                    parseAnalysisResult(result).then(resolve).catch(reject);
+                },
             };
+            batchQueue.push(job);
+            startBatchProcessor();
+        });
+    }
 
-            if (modelName) return exec(modelName);
-            return await withGeminiModelChain(exec, "analyzeStyle");
-        } catch (err: any) {
-            if (!hasFallbackProviders()) throw err;
-            console.warn("[gemini] analyzeStyle failed, trying providers:", err?.message?.slice(0, 100));
+    // Non-rate-limit error — throw immediately
+    throwGeminiError(err);
+}
+
+async function parseAnalysisResult(result: { text: string; imageBuffer: Buffer | null }): Promise<{ analysis: AnalysisResult; imageBuffer: Buffer | null }> {
+    let analysisData: any;
+    try {
+        analysisData = extractJson(result.text);
+    } catch (e) {
+        console.error("[gemini] failed to parse analysis JSON:", result.text.slice(0, 500));
+        throw new ApiError(502, "AI returned invalid analysis data. Please try again.", "AI_UNAVAILABLE");
+    }
+
+    // Validate photos
+    if (analysisData.valid === false || analysisData.all_same_person === false) {
+        if (!analysisData.valid) {
+            const invalidPhotos = (analysisData.photos ?? []).filter((p: any) => !p.valid);
+            if (invalidPhotos.length > 0) {
+                const p = invalidPhotos[0];
+                const label = ["front", "left side", "right side"][p.index] ?? `photo ${p.index + 1}`;
+                throw new ApiError(400, `Photo ${p.index + 1} (${label}): ${p.reason ?? "invalid"}`, "INVALID_PHOTOS");
+            }
+        }
+        if (analysisData.all_same_person === false) {
+            throw new ApiError(
+                400,
+                `The 3 photos don't appear to be the same person: ${analysisData.all_same_person_reason ?? "different people detected"}`,
+                "INVALID_PHOTOS",
+            );
         }
     }
 
-    if (hasFallbackProviders()) {
-        const providerImages = toProviderImages(images);
-        const { text } = await runWithProviderFallback({ prompt, images: providerImages });
-        return extractJson(text);
-    }
+    const analysis: AnalysisResult = {
+        face_shape: analysisData.face_shape ?? "oval",
+        hair_density: analysisData.hair_density ?? "medium",
+        hair_texture: analysisData.hair_texture ?? "straight",
+        hair_color: analysisData.hair_color ?? "dark brown",
+        suggested_haircut: analysisData.suggested_haircut ?? "Classic Cut",
+        styling_reason: analysisData.styling_reason ?? "",
+        analysis_details: analysisData.analysis_details ?? "",
+        generation_prompt: analysisData.generation_prompt ?? "",
+    };
 
-    throw new ApiError(503, "No AI providers available", "NOT_CONFIGURED");
+    return { analysis, imageBuffer: result.imageBuffer };
 }
 
-// ── Stage B: image generation ────────────────────────────────────────
+// ── public API ───────────────────────────────────────────────────────
 
-async function generateHaircutImage(
-    images: FetchedImage[],
+export type OutputResolution = "512" | "1K" | "2K";
+
+export interface AnalysisResult {
+    face_shape: string;
+    hair_density: string;
+    hair_texture: string;
+    hair_color: string;
+    suggested_haircut: string;
+    styling_reason: string;
+    analysis_details: string;
+    generation_prompt: string;
+}
+
+/**
+ * Run analysis pipeline — returns analysis JSON only (no image generation).
+ * Used by the async queue flow where analysis and generation are separate steps.
+ */
+export async function runAnalysisPipeline(
+    photoUrls: [string, string, string],
+): Promise<AnalysisResult> {
+    const { analysis } = await runSingleStepPipeline(photoUrls);
+    return analysis;
+}
+
+/**
+ * Public wrapper for the queue worker — fetches images, generates haircut image.
+ * Returns a PNG Buffer on success, null on failure.
+ */
+export async function generateHaircutImageForQueue(
+    photoUrls: string[],
     generationPrompt: string,
+    resolution: OutputResolution = "1K",
 ): Promise<Buffer | null> {
-    const prompt = `Using the person from these 3 reference photos (front, left, right angles), generate a single professional headshot.
+    try {
+        const images = await fetchImages(photoUrls as [string, string, string]);
+        const prompt = `Using the person from these 3 reference photos (front, left, right angles), generate a single professional headshot.
 
 CRITICAL — DO NOT CHANGE:
 - Face structure, shape, or proportions
@@ -324,142 +672,50 @@ Image requirements:
 - Do NOT stylize or cartoon-ify — this must look like a real photo
 - The person must look IDENTICAL to the reference photos except for the hair change`;
 
-    try {
-        const geminiParts = toGeminiParts(images);
-        const ai = getClient();
-        const result = await ai.models.generateContent({
-            model: IMAGE_GEN_MODEL,
-            contents: [{ role: "user", parts: [{ text: prompt }, ...geminiParts] }],
-        });
-        return extractGeneratedImage(result);
-    } catch (err: any) {
-        const status = err?.status ?? err?.code;
-        if (status === 429) {
-            console.warn("[gemini] image generation quota exhausted — returning null (analysis-only mode)");
-        } else {
-            console.error("[gemini] image generation failed:", err?.message ?? err);
-        }
+        const result = await withPipelineModelChain(async (model) => {
+            const ai = getClient();
+            const response = await ai.models.generateContent({
+                model,
+                contents: [{ role: "user", parts: [{ text: prompt }, ...toGeminiParts(images)] }],
+                config: {
+                    responseModalities: ["IMAGE"],
+                },
+            });
+            return extractGeneratedImage(response);
+        }, "imageGen");
+
+        return result;
+    } catch (err) {
+        console.error("[gemini] generateHaircutImageForQueue failed:", err);
         return null;
     }
 }
 
-// ── public API ───────────────────────────────────────────────────────
-
-export interface AnalysisResult {
-    face_shape: string;
-    hair_density: string;
-    hair_texture: string;
-    hair_color: string;
-    suggested_haircut: string;
-    styling_reason: string;
-    analysis_details: string;
-    generation_prompt: string;
-}
-
-export async function runAnalysisPipeline(
-    photoUrls: [string, string, string],
-): Promise<AnalysisResult> {
-    if (!isGeminiConfigured() && !hasFallbackProviders()) {
-        throw new ApiError(503, "No AI providers are configured", "NOT_CONFIGURED");
-    }
-
-    const images = await fetchImages(photoUrls);
-
-    const validation = await validatePhotos(images);
-
-    for (const photo of validation.photos) {
-        if (!photo.valid) {
-            const label = ["front", "left side", "right side"][photo.index] ?? `photo ${photo.index + 1}`;
-            throw new ApiError(
-                400,
-                `Photo ${photo.index + 1} (${label}): ${photo.reason ?? "invalid"}`,
-                "INVALID_PHOTOS",
-            );
-        }
-    }
-
-    if (validation.all_same_person === false) {
-        throw new ApiError(
-            400,
-            `The 3 photos don't appear to be the same person: ${validation.all_same_person_reason ?? "different people detected"}`,
-            "INVALID_PHOTOS",
-        );
-    }
-
-    const analysis = await analyzeStyle(images);
-    return analysis as AnalysisResult;
-}
-
+/**
+ * Full pipeline: validate + analyze + generate image in one step.
+ * Used by analyzeAndGenerate for immediate synchronous results.
+ */
 export async function analyzeAndGenerate(params: {
     customerId: string;
     photoUrls: [string, string, string];
     customerPrompt?: string;
+    resolution?: OutputResolution;
 }) {
-    if (!isGeminiConfigured() && !hasFallbackProviders()) {
-        throw new Error("No AI providers are configured");
+    if (!isGeminiConfigured()) {
+        throw new ApiError(503, "Gemini AI is not configured", "NOT_CONFIGURED");
     }
 
-    const images = await fetchImages(params.photoUrls);
-
-    const validation = await validatePhotos(images);
-
-    for (const photo of validation.photos) {
-        if (!photo.valid) {
-            const label = ["front", "left side", "right side"][photo.index] ?? `photo ${photo.index + 1}`;
-            throw new ApiError(
-                400,
-                `Photo ${photo.index + 1} (${label}): ${photo.reason ?? "invalid"}`,
-                "INVALID_PHOTOS",
-            );
-        }
-    }
-
-    if (validation.all_same_person === false) {
-        throw new ApiError(
-            400,
-            `The 3 photos don't appear to be the same person: ${validation.all_same_person_reason ?? "different people detected"}`,
-            "INVALID_PHOTOS",
-        );
-    }
-
-    let analysis: AnalysisResult;
-    let analysisProvider = "gemini";
-
-    if (isGeminiConfigured()) {
-        try {
-            analysis = await analyzeStyle(images, params.customerPrompt) as AnalysisResult;
-        } catch (err: any) {
-            if (!hasFallbackProviders()) throw err;
-            console.warn("[gemini] analyzeStyle failed, trying provider fallback with validation");
-            const providerImages = toProviderImages(images);
-            const result = await runWithFallbackAndValidation({
-                analysisPrompt: ANALYSIS_PROMPT_TEMPLATE(params.customerPrompt),
-                images: providerImages,
-            });
-            analysis = result.analysis;
-            analysisProvider = result.provider;
-        }
-    } else {
-        const providerImages = toProviderImages(images);
-        const result = await runWithFallbackAndValidation({
-            analysisPrompt: ANALYSIS_PROMPT_TEMPLATE(params.customerPrompt),
-            images: providerImages,
-        });
-        analysis = result.analysis;
-        analysisProvider = result.provider;
-    }
-
-    console.log(`[gemini] analysis completed via ${analysisProvider}`);
+    const { analysis, imageBuffer } = await runSingleStepPipeline(params.photoUrls, params.customerPrompt);
+    console.log("[gemini] single-step pipeline completed");
 
     let generatedImageUrl: string | null = null;
-    try {
-        const imgBuf = await generateHaircutImage(images, analysis.generation_prompt);
-        if (imgBuf) {
-            const uploaded = await uploadImage(imgBuf, "image/png", "haircut-generations");
+    if (imageBuffer) {
+        try {
+            const uploaded = await uploadImage(imageBuffer, "image/png", "haircut-generations");
             generatedImageUrl = uploaded.secureUrl;
+        } catch (err) {
+            console.error("[gemini] image upload failed:", err);
         }
-    } catch (err) {
-        console.error("[gemini] image upload pipeline failed:", err);
     }
 
     const supabase = getSupabaseSecret();
@@ -506,11 +762,29 @@ export async function generateChatAiReply(
         .map((m) => `${m.is_ai ? "Assistant" : "User"}: ${m.message}`)
         .join("\n");
 
-    const ai = getClient();
-    const result = await ai.models.generateContent({
-        model: "gemini-2.0-flash",
-        contents: [{ role: "user", parts: [{ text: `You are a helpful barber booking assistant for BookMyBarber in Pakistan. Be concise and friendly.\n\nConversation:\n${history}\n\nUser: ${userMessage}\n\nAssistant:` }] }],
-    });
+    const prompt = `You are a helpful barber booking assistant for BookMyBarber in Pakistan. Be concise and friendly.\n\nConversation:\n${history}\n\nUser: ${userMessage}\n\nAssistant:`;
 
-    return (result.text ?? "").trim();
+    let lastErr: any;
+    for (const model of CHAT_MODELS) {
+        try {
+            const ai = getClient();
+            const result = await ai.models.generateContent({
+                model,
+                contents: [{ role: "user", parts: [{ text: prompt }] }],
+            });
+            return (result.text ?? "").trim();
+        } catch (err: any) {
+            lastErr = err;
+            if (isRateLimited(err)) {
+                const info = parseRateLimitInfo(err);
+                const delay = (info.retryAfterMs && info.retryAfterMs < 10_000) ? info.retryAfterMs : 2_000;
+                await sleep(delay);
+                continue;
+            }
+            break;
+        }
+    }
+
+    console.error("[gemini] chat failed:", lastErr?.message ?? lastErr);
+    return "AI assistant is temporarily unavailable. Please try again.";
 }

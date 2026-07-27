@@ -1,7 +1,6 @@
 import { getSupabaseSecret } from "../config/supabase";
 import { logger } from "../config/logger";
 import { isGeminiConfigured, runAnalysisPipeline } from "./gemini.service";
-import { isColabConfigured, generateHaircutWithInstantID } from "./colab.service";
 import { uploadImage } from "./cloudinary.service";
 
 const POLL_INTERVAL_MS = 3_000;
@@ -23,8 +22,8 @@ interface HaircutRequest {
 
 /** Start the queue worker. Call once on server boot. */
 export function startHaircutQueue(): void {
-    if (!isGeminiConfigured() && !isColabConfigured()) {
-        logger.info("[haircut-queue] Gemini and Colab not configured — queue disabled");
+    if (!isGeminiConfigured()) {
+        logger.info("[haircut-queue] Gemini not configured — queue disabled");
         return;
     }
 
@@ -118,7 +117,7 @@ async function processJob(
 ): Promise<void> {
     const { id } = job;
 
-    // ── Stage 1: Gemini analysis ──────────────────────────────────
+    // ── Stage 1: Gemini analysis + image generation ───────────────
     await supabase.from("haircut_requests").update({ status: "analyzing" }).eq("id", id);
     logger.info("[haircut-queue] analyzing", { id });
 
@@ -148,37 +147,23 @@ async function processJob(
         }).eq("id", job.ai_analysis_id);
     }
 
-    if (!isColabConfigured()) {
-        // Colab not configured — complete with analysis only (no generated image)
-        await supabase.from("haircut_requests").update({ status: "completed" }).eq("id", id);
-        if (job.ai_analysis_id) {
-            await supabase.from("ai_analyses").update({ status: "completed" }).eq("id", job.ai_analysis_id);
-        }
-        logger.info("[haircut-queue] completed (analysis only, no Colab)", { id });
-        return;
-    }
-
-    // ── Stage 2: Colab InstantID generation ───────────────────────
+    // ── Stage 2: Generate haircut image via Gemini ────────────────
     await supabase.from("haircut_requests").update({ status: "processing" }).eq("id", id);
-    logger.info("[haircut-queue] generating image via Colab", { id });
+    logger.info("[haircut-queue] generating image via Gemini", { id });
 
-    // Download front image for Colab (needs base64)
-    const frontRes = await fetch(job.front_image_url);
-    const frontBuf = Buffer.from(await frontRes.arrayBuffer());
-    const frontBase64 = frontBuf.toString("base64");
-
-    const imgBuf = await generateHaircutWithInstantID({
-        frontImageBase64: frontBase64,
-        prompt: analysis.generation_prompt,
-    });
+    // Download images for Gemini (needs base64 via fetchImages in gemini.service)
+    // Use the same analyzeAndGenerate flow but we already have analysis
+    // Generate image directly with the generation prompt
+    const { generateHaircutImageForQueue } = await import("./gemini.service");
+    const imgBuf = await generateHaircutImageForQueue(imageUrls, analysis.generation_prompt);
 
     if (!imgBuf) {
-        // Colab failed — complete without image
+        // Image generation failed — complete with analysis only
         await supabase.from("haircut_requests").update({ status: "completed" }).eq("id", id);
         if (job.ai_analysis_id) {
             await supabase.from("ai_analyses").update({ status: "completed" }).eq("id", job.ai_analysis_id);
         }
-        logger.warn("[haircut-queue] Colab returned null — completed without image", { id });
+        logger.warn("[haircut-queue] image generation returned null — completed without image", { id });
         return;
     }
 

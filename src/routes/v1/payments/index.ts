@@ -14,7 +14,7 @@ import {
   getPaymentByTracker,
   updatePaymentStatus,
 } from "../../../services/payment.service";
-import { updateBookingPaymentStatus } from "../../../services/booking.service";
+import { updateBookingPaymentStatus, assertBookingPayable } from "../../../services/booking.service";
 
 const router = Router();
 
@@ -42,6 +42,10 @@ router.post(
     const { amountPkr, bookingId, source } = parsed.data;
     const checkoutSource =
       source === "mobile" ? ("mobile" as const) : ("hosted" as const);
+
+    if (bookingId) {
+      await assertBookingPayable(bookingId, req.user!.id);
+    }
 
     const { checkoutUrl, trackerToken } = await createCheckoutSession({
       amountPkr,

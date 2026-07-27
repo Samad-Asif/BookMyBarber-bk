@@ -6,6 +6,19 @@ export const BOOKING_MIN_LEAD_MINUTES = Math.max(
   Number.parseInt(MIN_LEAD_RAW, 10) || 30
 );
 
+const PAYMENT_TIMEOUT_RAW = process.env.BOOKING_PAYMENT_TIMEOUT_MINUTES ?? "30";
+export const BOOKING_PAYMENT_TIMEOUT_MINUTES = Math.max(
+  1,
+  Number.parseInt(PAYMENT_TIMEOUT_RAW, 10) || 30
+);
+
+/** ISO timestamp for unpaid booking payment deadline. */
+export function paymentDueAtFromNow(now = new Date()): string {
+  return new Date(
+    now.getTime() + BOOKING_PAYMENT_TIMEOUT_MINUTES * 60_000
+  ).toISOString();
+}
+
 /** YYYY-MM-DD in shop timezone */
 export function dateStringInTimezone(date: Date, timeZone: string): string {
   return new Intl.DateTimeFormat("en-CA", {

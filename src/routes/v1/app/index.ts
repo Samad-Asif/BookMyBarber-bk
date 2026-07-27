@@ -25,6 +25,7 @@ import feedbacksRouter from "./feedbacks";
 import workersRouter from "./workers";
 import workerServicesRouter from "./worker-services";
 import workerAvailabilityRouter from "./worker-availability";
+import reviewsRouter, { shopReviewsRouter } from "./reviews";
 
 const router = Router();
 const EARTH_RADIUS_KM = 6371;
@@ -59,9 +60,11 @@ router.use("/ai", aiRouter);
 router.use("/profile/avatar", avatarRouter);
 router.use("/chat", chatRouter);
 router.use("/feedbacks", feedbacksRouter);
+router.use("/reviews", reviewsRouter);
 router.use("/shops/:shopId/workers", workersRouter);
 router.use("/shops/:shopId/workers/:workerId/services", workerServicesRouter);
 router.use("/shops/:shopId/workers/:workerId/availability", workerAvailabilityRouter);
+router.use("/shops/:shopId", shopReviewsRouter);
 
 /**
  * ----------------------------------------------------
@@ -209,7 +212,8 @@ router.patch(
     if (!req.user) throw new ApiError(401, "Unauthorized", "UNAUTHORIZED");
 
     const { id: shopId } = req.params;
-    const { name, description, businessPhone, websiteUrl, logoUrl, bannerUrl } = req.body ?? {};
+    const { name, description, businessPhone, websiteUrl, logoUrl, bannerUrl, autoApprove } =
+      req.body ?? {};
 
     const supabase = getSupabaseSecret();
 
@@ -247,6 +251,12 @@ router.patch(
     }
     if (bannerUrl !== undefined) {
       updates.banner_url = typeof bannerUrl === "string" && bannerUrl.trim() ? bannerUrl.trim() : null;
+    }
+    if (autoApprove !== undefined) {
+      if (typeof autoApprove !== "boolean") {
+        throw new ApiError(400, "autoApprove must be a boolean", "VALIDATION_ERROR");
+      }
+      updates.auto_approve = autoApprove;
     }
 
     const { data, error } = await supabase
@@ -393,7 +403,8 @@ router.get(
     let dbQuery = supabase
       .from("barber_shops")
       .select("*")
-      .eq("status", "approved");
+      .eq("status", "approved")
+      .eq("is_public", true);
 
     if (city && typeof city === "string" && city.trim()) {
       dbQuery = dbQuery.eq("city", city.trim());
@@ -441,6 +452,7 @@ router.get(
       .from("barber_shops")
       .select("*")
       .eq("status", "approved")
+      .eq("is_public", true)
       .not("latitude", "is", null)
       .not("longitude", "is", null)
       .gte("latitude", lat - degreeLatBuffer)
@@ -597,28 +609,42 @@ router.get(
       throw new ApiError(404, "Barber shop not found", "NOT_FOUND");
     }
 
-    // Fetch workers
-    const { data: workers } = await supabase
-      .from("workers")
-      .select("*")
-      .eq("shop_id", id);
+    if (req.user?.role === "customer" && !shop.is_public) {
+      throw new ApiError(404, "Barber shop not found", "NOT_FOUND");
+    }
+
+    // Fetch active workers only (customers see public workers, barbers see all active)
+    const workersQuery = req.user?.role === "customer"
+      ? supabase.from("workers").select("*").eq("shop_id", id).eq("is_active", true).eq("is_public", true)
+      : supabase.from("workers").select("*").eq("shop_id", id).eq("is_active", true);
+    const { data: workers } = await workersQuery;
 
     const { data: workingHours } = await supabase
       .from("working_hours")
       .select("*")
       .eq("shop_id", id);
 
-    const { data: services } = await supabase
-      .from("shop_services")
-      .select("*")
-      .eq("shop_id", id)
-      .eq("is_active", true);
+    const servicesQuery = req.user?.role === "customer"
+      ? supabase.from("shop_services").select("*").eq("shop_id", id).eq("is_active", true).eq("is_public", true)
+      : supabase.from("shop_services").select("*").eq("shop_id", id).eq("is_active", true);
+    const { data: services } = await servicesQuery;
+
+    // Fetch worker ↔ service mapping
+    const workerIds = (workers ?? []).map((w: { id: string }) => w.id);
+    const { data: workerServices } =
+      workerIds.length > 0
+        ? await supabase
+          .from("worker_services")
+          .select("worker_id, service_id")
+          .in("worker_id", workerIds)
+        : { data: [] };
 
     res.json({
       shop,
       workers: workers || [],
       workingHours: workingHours || [],
       services: services || [],
+      workerServices: workerServices || [],
     });
   })
 );

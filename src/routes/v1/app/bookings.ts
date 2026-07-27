@@ -7,12 +7,14 @@ import { getShopOwnerId } from "../../../lib/shop";
 import { param } from "../../../lib/params";
 import {
   approveBookingBodySchema,
+  batchBookingBodySchema,
   createBookingBodySchema,
   customerBookingsQuerySchema,
   rejectBookingBodySchema,
 } from "../../../schemas/booking";
 import {
   approveBooking,
+  createBatchBookings,
   createBooking,
   listCustomerBookings,
   listShopBookings,
@@ -37,6 +39,26 @@ router.post(
     });
 
     res.status(201).json({ booking });
+  })
+);
+
+router.post(
+  "/batch",
+  authenticate,
+  authorize("customer"),
+  asyncHandler(async (req: Request, res: Response) => {
+    const parsed = batchBookingBodySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      const message = parsed.error.issues.map((i) => i.message).join("; ");
+      throw new ApiError(400, message, "VALIDATION_ERROR");
+    }
+
+    const result = await createBatchBookings({
+      customerId: req.user!.id,
+      ...parsed.data,
+    });
+
+    res.status(201).json(result);
   })
 );
 
