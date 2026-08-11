@@ -31,7 +31,14 @@ router.get(
   })
 );
 
-/** POST /shops/:shopId/workers — add a worker */
+/** POST /shops/:shopId/workers — add a worker
+ *
+ * DESIGN NOTE (do not "fix"): New workers intentionally start with ZERO
+ * service assignments. The barber assigns services explicitly via the
+ * "Assign Services" flow (PUT worker-services). Do NOT auto-link the shop's
+ * services here — a new worker does not necessarily perform every shop
+ * service. See fixing-docs "PDF 1 — Studio Item 3" (NOT NEEDED).
+ */
 router.post(
   "/",
   authenticate,
@@ -104,7 +111,15 @@ router.patch(
   })
 );
 
-/** DELETE /shops/:shopId/workers/:workerId — soft-deactivate */
+/** DELETE /shops/:shopId/workers/:workerId — soft-deactivate
+ *
+ * DESIGN NOTE (do not "fix"): This intentionally soft-deactivates the worker
+ * (is_active = false) instead of a permanent delete. booking_items, reviews,
+ * and other records reference workers.id, so a hard delete would orphan
+ * historical bookings/reviews. The mobile UI confirms "Deactivate" and keeps
+ * inactive workers visible for re-activation. Do NOT convert to a permanent
+ * delete. See fixing-docs "PDF 1 — Studio Item 5" (NOT NEEDED).
+ */
 router.delete(
   "/:workerId",
   authenticate,
