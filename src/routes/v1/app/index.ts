@@ -20,12 +20,15 @@ import slotsRouter from "./slots";
 import bookingsRouter from "./bookings";
 import aiRouter from "./ai";
 import avatarRouter from "./avatar";
+import shopPhotoRouter from "./shop-photo";
 import chatRouter from "./chat";
 import feedbacksRouter from "./feedbacks";
 import workersRouter from "./workers";
 import workerServicesRouter from "./worker-services";
 import workerAvailabilityRouter from "./worker-availability";
 import reviewsRouter, { shopReviewsRouter } from "./reviews";
+import analyticsRouter from "./analytics";
+import { searchShopsQuerySchema, servicesSearchQuerySchema } from "../../../schemas/search";
 
 const router = Router();
 const EARTH_RADIUS_KM = 6371;
@@ -36,6 +39,10 @@ function parseNumericInput(value: unknown, fieldName: string): number {
     throw new ApiError(400, `${fieldName} must be a valid number`, "VALIDATION_ERROR");
   }
   return numeric;
+}
+
+function sanitizeSearchText(input: string): string {
+  return input.replace(/[^\w\s&'-]/g, " ").trim().slice(0, 120);
 }
 
 function haversineDistanceKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
@@ -58,12 +65,14 @@ router.use("/shops/:shopId/slots", slotsRouter);
 router.use("/bookings", bookingsRouter);
 router.use("/ai", aiRouter);
 router.use("/profile/avatar", avatarRouter);
+router.use("/shops/photo", shopPhotoRouter);
 router.use("/chat", chatRouter);
 router.use("/feedbacks", feedbacksRouter);
 router.use("/reviews", reviewsRouter);
 router.use("/shops/:shopId/workers", workersRouter);
 router.use("/shops/:shopId/workers/:workerId/services", workerServicesRouter);
 router.use("/shops/:shopId/workers/:workerId/availability", workerAvailabilityRouter);
+router.use("/shops/:shopId/analytics", analyticsRouter);
 router.use("/shops/:shopId", shopReviewsRouter);
 
 /**
@@ -391,13 +400,23 @@ router.get(
  * ----------------------------------------------------
  */
 
-/** GET /v1/app/shops/search — query approved shops by city or globally */
+type ShopRow = Record<string, unknown> & { latitude: number; longitude: number; name: string };
+
+/** GET /v1/app/shops/search — query approved shops by city, text, or coordinates */
 router.get(
   "/shops/search",
   authenticate,
   authorize("customer", "barber"),
   asyncHandler(async (req: Request, res: Response) => {
-    const { city, query } = req.query;
+    const q = searchShopsQuerySchema.safeParse(req.query);
+    if (!q.success) {
+      throw new ApiError(400, "Invalid search query", "VALIDATION_ERROR");
+    }
+    const { city, query, lat, lng, radiusKm, limit } = q.data;
+    const sanitizedQuery = query ? sanitizeSearchText(query) : undefined;
+
+    const hasCoords = lat !== undefined && lng !== undefined;
+    const effLimit = limit ?? (hasCoords ? 50 : 20);
 
     const supabase = getSupabaseSecret();
     let dbQuery = supabase
@@ -406,24 +425,121 @@ router.get(
       .eq("status", "approved")
       .eq("is_public", true);
 
-    if (city && typeof city === "string" && city.trim()) {
-      dbQuery = dbQuery.eq("city", city.trim());
+    if (city) {
+      dbQuery = dbQuery.eq("city", city);
+    }
+    if (sanitizedQuery) {
+      // Quote values so PostgREST does not misparse the filter list and drop AND-ed geo filters.
+      const q = sanitizedQuery.replace(/"/g, "");
+      dbQuery = dbQuery.or(`name.ilike."%${q}%",description.ilike."%${q}%"`);
+    }
+    if (hasCoords) {
+      const degreeLatBuffer = (radiusKm ?? 10) / 111;
+      const degreeLngBuffer = (radiusKm ?? 10) / (111 * Math.max(Math.cos((lat * Math.PI) / 180), 0.01));
+      dbQuery = dbQuery
+        .not("latitude", "is", null)
+        .not("longitude", "is", null)
+        .gte("latitude", lat - degreeLatBuffer)
+        .lte("latitude", lat + degreeLatBuffer)
+        .gte("longitude", lng - degreeLngBuffer)
+        .lte("longitude", lng + degreeLngBuffer);
     }
 
-    if (query && typeof query === "string" && query.trim().length >= 2) {
-      const q = `%${query.trim()}%`;
-      dbQuery = dbQuery.or(`name.ilike.${q},description.ilike.${q}`);
-    }
-
-    dbQuery = dbQuery.order("name").limit(20);
-
-    const { data, error } = await dbQuery;
-
+    // over-fetch 3x when filtering by distance in JS
+    const { data, error } = await dbQuery.limit(hasCoords ? effLimit * 3 : effLimit);
     if (error) {
       throw new ApiError(500, error.message, "DB_ERROR");
     }
 
-    res.json({ shops: data || [] });
+    let shops = (data || []) as ShopRow[];
+    if (hasCoords) {
+      shops = shops
+        .map((s) => {
+          const d = haversineDistanceKm(lat!, lng!, Number(s.latitude), Number(s.longitude));
+          return { ...s, distance_km: Number(d.toFixed(2)) };
+        })
+        .filter((s) => s.distance_km <= (radiusKm ?? 10))
+        .sort((a, b) => a.distance_km - b.distance_km)
+        .slice(0, effLimit);
+    } else {
+      shops.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    }
+
+    res.json({ shops });
+  })
+);
+
+type ServiceRow = Record<string, unknown> & {
+  shop: Record<string, unknown> & { latitude: number; longitude: number };
+};
+
+/** GET /v1/app/services/search — search public services across approved shops */
+router.get(
+  "/services/search",
+  authenticate,
+  authorize("customer", "barber"),
+  asyncHandler(async (req: Request, res: Response) => {
+    const q = servicesSearchQuerySchema.safeParse(req.query);
+    if (!q.success) {
+      throw new ApiError(400, "Invalid search query", "VALIDATION_ERROR");
+    }
+    const { query, lat, lng, radiusKm, limit } = q.data;
+    const sanitizedQuery = query ? sanitizeSearchText(query) : undefined;
+
+    const hasCoords = lat !== undefined && lng !== undefined;
+    const effRadius = radiusKm ?? 10;
+    const effLimit = limit ?? 20;
+
+    const degreeLatBuffer = hasCoords ? effRadius / 111 : 0;
+    const cosLat = hasCoords ? Math.max(Math.cos((lat! * Math.PI) / 180), 0.01) : 1;
+    const degreeLngBuffer = hasCoords ? effRadius / (111 * cosLat) : 0;
+
+    const supabase = getSupabaseSecret();
+
+    let dbQuery = supabase
+      .from("shop_services")
+      .select(
+        "id, name, description, duration_minutes, price_pkr, avg_rating, ratings_count, shop:barber_shops!inner(id, name, address, city, avg_rating, ratings_count, banner_url, latitude, longitude)"
+      )
+      .eq("is_active", true)
+      .eq("is_public", true)
+      .eq("shop.status", "approved")
+      .eq("shop.is_public", true);
+
+    if (sanitizedQuery) {
+      const q = sanitizedQuery.replace(/"/g, "");
+      dbQuery = dbQuery.or(`name.ilike."%${q}%",description.ilike."%${q}%"`);
+    }
+    if (hasCoords) {
+      dbQuery = dbQuery
+        .gte("shop.latitude", lat! - degreeLatBuffer)
+        .lte("shop.latitude", lat! + degreeLatBuffer)
+        .gte("shop.longitude", lng! - degreeLngBuffer)
+        .lte("shop.longitude", lng! + degreeLngBuffer);
+    }
+
+    const { data, error } = await dbQuery.limit(hasCoords ? effLimit * 3 : effLimit);
+    if (error) {
+      throw new ApiError(500, error.message, "DB_ERROR");
+    }
+
+    let services = (data || []) as unknown as ServiceRow[];
+    if (hasCoords) {
+      services = services
+        .map((s) => {
+          const shop = s.shop;
+          const d = haversineDistanceKm(lat!, lng!, Number(shop.latitude), Number(shop.longitude));
+          return { ...s, distance_km: Number(d.toFixed(2)) };
+        })
+        .filter((s) => s.distance_km <= effRadius)
+        .sort((a, b) => a.distance_km - b.distance_km)
+        .slice(0, effLimit);
+    }
+
+    res.json({
+      ...(hasCoords ? { searchCenter: { lat, lng }, radiusKm: effRadius } : {}),
+      services,
+    });
   })
 );
 
