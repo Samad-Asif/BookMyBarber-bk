@@ -21,7 +21,7 @@ app.set("trust proxy", 1);
 
 const allowedOrigins = (
   process.env.CORS_ORIGINS ??
-  "http://localhost:5173,http://localhost:8081,http://localhost:19006"
+  "http://localhost:5173,http://localhost:8081,http://localhost:19006,https://book-my-barber-admin.vercel.app"
 )
   .split(",")
   .map((o) => o.trim())
@@ -34,6 +34,9 @@ function isAllowedCorsOrigin(origin: string | undefined): boolean {
   if (allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
     return true;
   }
+  // Production admin dashboard (Vercel) — always allowed so login works
+  // regardless of dashboard-managed CORS_ORIGINS.
+  if (origin === "https://book-my-barber-admin.vercel.app") return true;
   if (!relaxDevCors) return false;
 
   try {
