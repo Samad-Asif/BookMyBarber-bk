@@ -6,7 +6,8 @@ export const createServiceBodySchema = z.object({
   durationMinutes: z.coerce
     .number()
     .int()
-    .positive("durationMinutes must be a positive integer"),
+    .positive("durationMinutes must be a positive integer")
+    .max(120, "durationMinutes must be at most 120"),
   pricePkr: z.coerce
     .number()
     .int()
@@ -23,6 +24,7 @@ export const updateServiceBodySchema = z
       .number()
       .int()
       .positive()
+      .max(120, "durationMinutes must be at most 120")
       .optional(),
     pricePkr: z.coerce.number().int().positive().optional(),
     isActive: z.boolean().optional(),
