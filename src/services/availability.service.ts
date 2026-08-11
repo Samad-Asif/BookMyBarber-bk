@@ -7,9 +7,13 @@ import {
   DEFAULT_SHOP_TIMEZONE,
   minutesOfDayInTimezone,
   minutesToTimeString,
+  nextDateString,
   parseTimeToMinutes,
   rangesOverlap,
+  utcInstantForLocalMidnight,
 } from "../lib/booking-time";
+
+const SHOP_TIMEZONE = DEFAULT_SHOP_TIMEZONE;
 
 const SLOT_STEP_MINUTES = 15;
 const COMMISSION_RATE = 0.1;
@@ -98,7 +102,6 @@ export interface SlotBookableParams {
   excludeBookingId?: string;
   requireApproved?: boolean;
   checkPast?: boolean;
-  timezone?: string;
 }
 
 interface ShopSlotContext {
@@ -162,8 +165,7 @@ async function loadShopSlotContext(
   shopId: string,
   date: string,
   workerId: string | null | undefined,
-  excludeBookingId?: string,
-  timezoneOverride?: string
+  excludeBookingId?: string
 ): Promise<ShopSlotContext> {
   // Free slots held by abandoned unpaid bookings before computing availability
   const { expireUnpaidBookings } = await import("./booking-expiry.service");
@@ -173,7 +175,7 @@ async function loadShopSlotContext(
 
   const { data: shop, error: shopErr } = await supabase
     .from("barber_shops")
-    .select("owner_id, timezone")
+    .select("owner_id")
     .eq("id", shopId)
     .single();
 
@@ -181,11 +183,7 @@ async function loadShopSlotContext(
     throw new ApiError(404, "Barber shop not found", "NOT_FOUND");
   }
 
-  const timezone =
-    timezoneOverride ??
-    (typeof shop.timezone === "string" && shop.timezone.length > 0
-      ? shop.timezone
-      : DEFAULT_SHOP_TIMEZONE);
+  const timezone = SHOP_TIMEZONE;
 
   const dayOfWeek = dayOfWeekInTimezone(date, timezone);
 
@@ -215,8 +213,8 @@ async function loadShopSlotContext(
       const supabase2 = getSupabaseSecret();
       let busyRanges: { start: number; end: number }[] = [];
       if (shop.owner_id) {
-        const dayStart = new Date(`${date}T00:00:00.000Z`);
-        const dayEnd = new Date(`${date}T23:59:59.999Z`);
+        const dayStart = utcInstantForLocalMidnight(date, timezone);
+        const dayEnd = utcInstantForLocalMidnight(nextDateString(date), timezone);
         const { data: busyBlocks } = await supabase2
           .from("calendar_busy_blocks")
           .select("start_at, end_at")
@@ -283,8 +281,8 @@ async function loadShopSlotContext(
 
   if (userIds.length > 0) {
     const supabase3 = getSupabaseSecret();
-    const dayStart = new Date(`${date}T00:00:00.000Z`);
-    const dayEnd = new Date(`${date}T23:59:59.999Z`);
+    const dayStart = utcInstantForLocalMidnight(date, timezone);
+    const dayEnd = utcInstantForLocalMidnight(nextDateString(date), timezone);
 
     const { data: busyBlocks } = await supabase3
       .from("calendar_busy_blocks")
@@ -350,7 +348,7 @@ export async function assertSlotBookable(params: SlotBookableParams): Promise<vo
   const supabase = getSupabaseSecret();
   const { data: shop, error: shopErr } = await supabase
     .from("barber_shops")
-    .select("status, owner_id, timezone")
+    .select("status, owner_id")
     .eq("id", params.shopId)
     .single();
 
@@ -366,11 +364,7 @@ export async function assertSlotBookable(params: SlotBookableParams): Promise<vo
     );
   }
 
-  const timezone =
-    params.timezone ??
-    (typeof shop.timezone === "string" && shop.timezone.length > 0
-      ? shop.timezone
-      : DEFAULT_SHOP_TIMEZONE);
+  const timezone = SHOP_TIMEZONE;
 
   if (params.checkPast !== false) {
     assertNotPastSlot(params.date, startMin, timezone);
@@ -380,8 +374,7 @@ export async function assertSlotBookable(params: SlotBookableParams): Promise<vo
     params.shopId,
     params.date,
     params.workerId ?? null,
-    params.excludeBookingId,
-    timezone
+    params.excludeBookingId
   );
 
   assertWithinWorkingHours(startMin, endMin, ctx.openMin, ctx.closeMin);

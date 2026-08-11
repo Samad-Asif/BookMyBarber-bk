@@ -7,6 +7,7 @@ import {
   rangesOverlap,
 } from "../lib/booking-time";
 import { assertShopOwner, getShopOwnerId } from "../lib/shop";
+import { withShopDateLock } from "../lib/booking-lock";
 import {
   assertSlotBookable,
   computeCommission,
@@ -14,6 +15,7 @@ import {
 import { expireUnpaidBookings } from "./booking-expiry.service";
 import type { BatchBookingItem } from "../schemas/booking";
 import { createCalendarEventForBooking } from "./calendar/calendar.service";
+import { sendWelcomeOnApproval } from "./chat.service";
 
 async function assertWorkerBelongsToShop(
   shopId: string,
@@ -114,17 +116,7 @@ export async function createBooking(params: {
   const price = params.requestedPricePkr ?? (service.price_pkr as number);
   const endTime = endTimeFromStartAndDuration(params.startTime, duration);
 
-  await assertSlotBookable({
-    shopId: params.shopId,
-    date: params.bookingDate,
-    startTime: params.startTime,
-    endTime,
-    workerId: resolvedWorkerId,
-    requireApproved: true,
-    checkPast: true,
-  });
-
-  // Re-assert immediately before insert to shrink the race window
+  // Soft check for fast feedback before acquiring the lock.
   await assertSlotBookable({
     shopId: params.shopId,
     date: params.bookingDate,
@@ -138,35 +130,55 @@ export async function createBooking(params: {
   const commission = computeCommission(price);
   const paymentDueAt = paymentDueAtFromNow();
 
-  const { data, error } = await supabase
-    .from("bookings")
-    .insert({
-      customer_id: params.customerId,
-      shop_id: params.shopId,
-      worker_id: resolvedWorkerId,
-      service_id: params.serviceId,
-      booking_date: params.bookingDate,
-      start_time: params.startTime,
-      end_time: endTime,
-      status: "pending",
-      price_pkr: price,
-      commission_pkr: commission,
-      requested_duration_minutes: params.requestedDurationMinutes ?? null,
-      requested_price_pkr: params.requestedPricePkr ?? null,
-      customer_notes: params.customerNotes ?? null,
-      payment_status: "unpaid",
-      payment_due_at: paymentDueAt,
-    })
-    .select(
-      `*, shop_services(name, duration_minutes, price_pkr), barber_shops(name, city)`
-    )
-    .single();
+  // Serialize per (shop, date): the availability check + insert below run while
+  // holding an advisory lock, so concurrent bookings for the same slot cannot
+  // both pass the check (TOCTOU / double-booking fix).
+  return withShopDateLock(params.shopId, params.bookingDate, async () => {
+    // Authoritative re-check under the lock.
+    await assertSlotBookable({
+      shopId: params.shopId,
+      date: params.bookingDate,
+      startTime: params.startTime,
+      endTime,
+      workerId: resolvedWorkerId,
+      requireApproved: true,
+      checkPast: true,
+    });
 
-  if (error || !data) {
-    throw new ApiError(400, error?.message ?? "Failed to create booking", "DB_ERROR");
-  }
+    const { data, error } = await supabase
+      .from("bookings")
+      .insert({
+        customer_id: params.customerId,
+        shop_id: params.shopId,
+        worker_id: resolvedWorkerId,
+        service_id: params.serviceId,
+        booking_date: params.bookingDate,
+        start_time: params.startTime,
+        end_time: endTime,
+        status: "pending",
+        price_pkr: price,
+        commission_pkr: commission,
+        requested_duration_minutes: params.requestedDurationMinutes ?? null,
+        requested_price_pkr: params.requestedPricePkr ?? null,
+        customer_notes: params.customerNotes ?? null,
+        payment_status: "unpaid",
+        payment_due_at: paymentDueAt,
+      })
+      .select(
+        `*, shop_services(name, duration_minutes, price_pkr), barber_shops(name, city)`
+      )
+      .single();
 
-  return data;
+    if (error || !data) {
+      throw new ApiError(
+        400,
+        error?.message ?? "Failed to create booking",
+        "DB_ERROR"
+      );
+    }
+
+    return data;
+  });
 }
 
 export async function createBatchBookings(params: {
@@ -287,18 +299,7 @@ export async function createBatchBookings(params: {
     }
   }
 
-  // Assert all slots bookable (twice: soft check + re-assert before insert)
-  for (const item of resolvedItems) {
-    await assertSlotBookable({
-      shopId: params.shopId,
-      date: params.bookingDate,
-      startTime: item.startTime,
-      endTime: item.endTime,
-      workerId: item.workerId,
-      requireApproved: true,
-      checkPast: true,
-    });
-  }
+  // Soft check for fast feedback before acquiring the lock.
   for (const item of resolvedItems) {
     await assertSlotBookable({
       shopId: params.shopId,
@@ -320,89 +321,106 @@ export async function createBatchBookings(params: {
   const bookingEnd = lastItem.endTime;
   const totalPricePkr = resolvedItems.reduce((sum, i) => sum + i.price, 0);
 
-  // Create ONE booking record
-  const firstItem = sortedByStart[0];
-  const commission = computeCommission(totalPricePkr);
-  const paymentDueAt = paymentDueAtFromNow();
+  // Create ONE booking record (+ items). Wrapped in an advisory lock per
+  // (shop, date) so concurrent batches for the same slot serialize and the
+  // re-check below sees already-committed rows (TOCTOU / double-booking fix).
+  return withShopDateLock(params.shopId, params.bookingDate, async () => {
+    // Authoritative re-check under the lock.
+    for (const item of resolvedItems) {
+      await assertSlotBookable({
+        shopId: params.shopId,
+        date: params.bookingDate,
+        startTime: item.startTime,
+        endTime: item.endTime,
+        workerId: item.workerId,
+        requireApproved: true,
+        checkPast: true,
+      });
+    }
 
-  const { data: booking, error: bookingErr } = await supabase
-    .from("bookings")
-    .insert({
-      customer_id: params.customerId,
-      shop_id: params.shopId,
-      worker_id: firstItem.workerId,
-      service_id: firstItem.serviceId,
-      booking_date: params.bookingDate,
-      start_time: bookingStart,
-      end_time: bookingEnd,
-      status: "pending",
-      price_pkr: totalPricePkr,
-      total_price_pkr: totalPricePkr,
-      commission_pkr: commission,
-      requested_duration_minutes: resolvedItems.reduce(
-        (sum, i) => sum + i.duration,
-        0
-      ),
-      requested_price_pkr: totalPricePkr,
-      customer_notes: params.customerNotes ?? null,
-      payment_status: "unpaid",
-      payment_due_at: paymentDueAt,
-    })
-    .select()
-    .single();
+    const firstItem = sortedByStart[0];
+    const commission = computeCommission(totalPricePkr);
+    const paymentDueAt = paymentDueAtFromNow();
 
-  if (bookingErr || !booking) {
-    throw new ApiError(
-      400,
-      bookingErr?.message ?? "Failed to create booking",
-      "DB_ERROR"
-    );
-  }
+    const { data: booking, error: bookingErr } = await supabase
+      .from("bookings")
+      .insert({
+        customer_id: params.customerId,
+        shop_id: params.shopId,
+        worker_id: firstItem.workerId,
+        service_id: firstItem.serviceId,
+        booking_date: params.bookingDate,
+        start_time: bookingStart,
+        end_time: bookingEnd,
+        status: "pending",
+        price_pkr: totalPricePkr,
+        total_price_pkr: totalPricePkr,
+        commission_pkr: commission,
+        requested_duration_minutes: resolvedItems.reduce(
+          (sum, i) => sum + i.duration,
+          0
+        ),
+        requested_price_pkr: totalPricePkr,
+        customer_notes: params.customerNotes ?? null,
+        payment_status: "unpaid",
+        payment_due_at: paymentDueAt,
+      })
+      .select()
+      .single();
 
-  // Create booking_items rows
-  const itemsToInsert = resolvedItems.map((i) => ({
-    booking_id: booking.id,
-    service_id: i.serviceId,
-    worker_id: i.workerId,
-    start_time: i.startTime,
-    end_time: i.endTime,
-    price_pkr: i.price,
-    duration_minutes: i.duration,
-  }));
+    if (bookingErr || !booking) {
+      throw new ApiError(
+        400,
+        bookingErr?.message ?? "Failed to create booking",
+        "DB_ERROR"
+      );
+    }
 
-  const { error: itemsErr } = await supabase
-    .from("booking_items")
-    .insert(itemsToInsert);
+    // Create booking_items rows
+    const itemsToInsert = resolvedItems.map((i) => ({
+      booking_id: booking.id,
+      service_id: i.serviceId,
+      worker_id: i.workerId,
+      start_time: i.startTime,
+      end_time: i.endTime,
+      price_pkr: i.price,
+      duration_minutes: i.duration,
+    }));
 
-  if (itemsErr) {
-    throw new ApiError(
-      400,
-      itemsErr.message ?? "Failed to create booking items",
-      "DB_ERROR"
-    );
-  }
+    const { error: itemsErr } = await supabase
+      .from("booking_items")
+      .insert(itemsToInsert);
 
-  // Fetch the complete booking with joins
-  const { data: fullBooking } = await supabase
-    .from("bookings")
-    .select(
-      `*, shop_services(name, duration_minutes, price_pkr), barber_shops(name, city), workers(name)`
-    )
-    .eq("id", booking.id)
-    .single();
+    if (itemsErr) {
+      throw new ApiError(
+        400,
+        itemsErr.message ?? "Failed to create booking items",
+        "DB_ERROR"
+      );
+    }
 
-  // Fetch booking_items with service/worker names
-  const { data: bookingItems } = await supabase
-    .from("booking_items")
-    .select(`*, shop_services(name), workers(name)`)
-    .eq("booking_id", booking.id);
+    // Fetch the complete booking with joins
+    const { data: fullBooking } = await supabase
+      .from("bookings")
+      .select(
+        `*, shop_services(name, duration_minutes, price_pkr), barber_shops(name, city), workers(name)`
+      )
+      .eq("id", booking.id)
+      .single();
 
-  return {
-    booking: fullBooking ?? booking,
-    items: bookingItems ?? [],
-    totalPricePkr,
-    bookingId: booking.id,
-  };
+    // Fetch booking_items with service/worker names
+    const { data: bookingItems } = await supabase
+      .from("booking_items")
+      .select(`*, shop_services(name), workers(name)`)
+      .eq("booking_id", booking.id);
+
+    return {
+      booking: fullBooking ?? booking,
+      items: bookingItems ?? [],
+      totalPricePkr,
+      bookingId: booking.id,
+    };
+  });
 }
 
 export async function approveBooking(params: {
@@ -506,6 +524,18 @@ export async function approveBooking(params: {
     }
   } catch {
     // Calendar sync is best-effort
+  }
+
+  try {
+    await sendWelcomeOnApproval({
+      shopId: booking.shop_id as string,
+      customerId: booking.customer_id as string,
+      bookingDate: booking.booking_date as string,
+      startTime: booking.start_time as string,
+      barberNotes: params.barberNotes ?? (booking.barber_notes as string | null),
+    });
+  } catch {
+    // welcome message is best-effort; approval already succeeded
   }
 
   return updated;
@@ -623,6 +653,20 @@ export async function updateBookingPaymentStatus(
     }
   } catch {
     // Calendar sync is best-effort
+  }
+
+  if (ownerId) {
+    try {
+      await sendWelcomeOnApproval({
+        shopId: booking.shop_id as string,
+        customerId: booking.customer_id as string,
+        bookingDate: booking.booking_date as string,
+        startTime: booking.start_time as string,
+        barberNotes: (booking.barber_notes as string | null) ?? null,
+      });
+    } catch {
+      // best-effort
+    }
   }
 }
 
@@ -771,7 +815,7 @@ export async function assertBookingPayable(bookingId: string, customerId: string
   const supabase = getSupabaseSecret();
   const { data: booking } = await supabase
     .from("bookings")
-    .select("id, customer_id, status, payment_status, payment_due_at")
+    .select("id, customer_id, status, payment_status, payment_due_at, price_pkr")
     .eq("id", bookingId)
     .maybeSingle();
 

@@ -72,6 +72,27 @@ export function minutesToTimeString(minutes: number): string {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`;
 }
 
+/** YYYY-MM-DD for the day after dateStr (validates via UTC noon). */
+export function nextDateString(dateStr: string): string {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const next = new Date(Date.UTC(y, m - 1, d + 1));
+  return next.toISOString().slice(0, 10);
+}
+
+/**
+ * UTC instant of local midnight (start of day) for dateStr in timeZone.
+ * Anchors on UTC noon, subtracts the local time-of-day to reach midnight,
+ * then adjusts ±1h when a DST transition shifts the offset across the boundary.
+ */
+export function utcInstantForLocalMidnight(dateStr: string, timeZone: string): Date {
+  const noon = new Date(`${dateStr}T12:00:00.000Z`);
+  let start = new Date(noon.getTime() - minutesOfDayInTimezone(noon, timeZone) * 60_000);
+  const localDate = dateStringInTimezone(start, timeZone);
+  if (localDate < dateStr) start = new Date(start.getTime() + 3_600_000);
+  else if (localDate > dateStr) start = new Date(start.getTime() - 3_600_000);
+  return start;
+}
+
 export function rangesOverlap(
   aStart: number,
   aEnd: number,
