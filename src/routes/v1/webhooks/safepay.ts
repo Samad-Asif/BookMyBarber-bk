@@ -11,6 +11,10 @@ const router = Router();
 router.post(
   "/",
   asyncHandler(async (req: Request, res: Response) => {
+    const rawBody = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(JSON.stringify(req.body ?? {}));
+
     let body: unknown = req.body;
 
     if (Buffer.isBuffer(body)) {
@@ -23,10 +27,19 @@ router.post(
     }
 
     const signature =
+      (req.headers["x-sfpy-signature"] as string) ??
       (req.headers["x-safepay-signature"] as string) ??
       (req.headers["x-webhook-secret"] as string);
+    const timestamp =
+      (req.headers["x-sfpy-timestamp"] as string) ??
+      (req.headers["x-safepay-timestamp"] as string);
 
-    const result = await processWebhookPayload(body, signature);
+    const result = await processWebhookPayload(
+      body,
+      signature,
+      timestamp,
+      rawBody
+    );
 
     const payment = await updatePaymentStatus(result.trackerToken, result.status, {
       webhook: body,

@@ -44,6 +44,24 @@ export async function createPendingPayment(params: {
   return data as PaymentRecord;
 }
 
+export async function getPendingPaymentForBooking(
+  bookingId: string
+): Promise<PaymentRecord | null> {
+  const supabase = getSupabaseSecret();
+  const { data, error } = await supabase
+    .from("payments")
+    .select()
+    .eq("booking_id", bookingId)
+    .eq("status", "pending")
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return data as PaymentRecord | null;
+}
+
 export async function getPaymentByTracker(
   trackerToken: string
 ): Promise<PaymentRecord | null> {

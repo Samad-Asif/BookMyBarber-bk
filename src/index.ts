@@ -68,7 +68,7 @@ app.use(morgan("dev"));
 app.use(express.json());
 
 /** SafePay webhook — mounted separately with raw body support */
-app.post(
+app.use(
   "/v1/webhooks/safepay",
   express.raw({ type: "application/json" }),
   safepayWebhookRouter

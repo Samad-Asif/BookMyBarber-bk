@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { getSafepayClient, getSafepayEnv } from "../config/safepay";
 import { ApiError } from "../lib/errors";
 
@@ -100,6 +101,33 @@ export async function createCheckoutSession(params: {
     );
   }
 
+  const checkoutUrl = await buildCheckoutUrl({
+    trackerToken,
+    source: params.source,
+    customerToken: params.customerToken,
+    bookingId: params.bookingId,
+  });
+
+  return { checkoutUrl, trackerToken };
+}
+
+/** `source` controls redirect attachment: redirect/cancel URLs are only added for `"hosted"` (or unset); `"mobile"` omits them entirely. */
+interface CheckoutUrlParams {
+  trackerToken: string;
+  customerToken?: string;
+  bookingId?: string;
+  source?: "hosted" | "mobile";
+}
+
+/**
+ * Build a checkout URL for an existing tracker token. SafePay's `tbt`
+ * passport is single-use, so an idempotent replay must request a fresh
+ * passport but keep the same tracker token.
+ */
+async function buildCheckoutUrl(params: CheckoutUrlParams): Promise<string> {
+  const safepay = getSafepayClient();
+  const env = getSafepayEnv();
+
   let passportResponse: unknown;
   try {
     passportResponse = await safepay.client.passport.create();
@@ -118,18 +146,24 @@ export async function createCheckoutSession(params: {
     );
   }
 
-  const checkoutUrl = safepay.checkout.createCheckoutUrl({
+  const isHosted = (params.source ?? "hosted") === "hosted";
+
+  return safepay.checkout.createCheckoutUrl({
     env: env.environment,
     tbt,
-    tracker: trackerToken,
+    tracker: params.trackerToken,
     source: params.source ?? "hosted",
-    redirect_url: env.redirectUrl,
-    cancel_url: env.cancelUrl,
+    ...(isHosted ? { redirect_url: env.redirectUrl, cancel_url: env.cancelUrl } : {}),
     ...(params.customerToken ? { user_id: params.customerToken } : {}),
     ...(params.bookingId ? { order_id: params.bookingId } : {}),
   });
+}
 
-  return { checkoutUrl, trackerToken };
+/** Regenerate a fresh checkout URL for an existing tracker token (idempotent replay). */
+export async function createCheckoutUrlForTracker(
+  params: CheckoutUrlParams
+): Promise<string> {
+  return buildCheckoutUrl(params);
 }
 
 export async function fetchTrackerStatus(
@@ -186,15 +220,119 @@ export function extractWebhookEventType(body: unknown): string {
   return String(b.type ?? b.event ?? b.name ?? "");
 }
 
+/**
+ * Verify a SafePay webhook signature. Three documented SafePay formats are
+ * accepted (all keyed by the shared webhook secret, so none lowers the auth
+ * bar):
+ * - Current (raast): HMAC-SHA256 over `timestamp + "." + raw_body`, key =
+ *   base64-decoded webhook secret, sent as `sha256=<hex>` with an
+ *   `X-SFPY-TIMESTAMP` header.
+ * - Legacy (safepay-php `Verify`): HMAC-SHA512 over `JSON.stringify(payload.data)`
+ *   (unescaped slashes), key = webhook secret as-is, sent as bare hex.
+ * - `sfpy-php` SDK: HMAC-SHA512 over the whole (re)serialized body, key =
+ *   webhook secret as-is, sent as bare hex.
+ *
+ * A local-dev tool may instead send the raw secret verbatim in an
+ * `X-WEBHOOK-SECRET` header; that is accepted for parity with the pre-existing
+ * behavior. Returns true when any format matches.
+ */
+export function verifyWebhookSignature(
+  rawBody: Buffer,
+  parsedBody: unknown,
+  signatureHeader: string | undefined,
+  timestampHeader: string | undefined,
+  webhookSecret: string
+): boolean {
+  if (!signatureHeader) return false;
+
+  const given = signatureHeader.trim();
+  const secret = webhookSecret;
+
+  const safeEqual = (a: Buffer, b: Buffer): boolean => {
+    if (a.length !== b.length) return false;
+    return timingSafeEqual(a, b);
+  };
+  const hexEqual = (a: string, b: string): boolean => {
+    const normalized = (s: string) => s.replace(/^sha256=/i, "").toLowerCase();
+    const left = normalized(a);
+    const right = normalized(b);
+    if (left.length !== right.length) return false;
+    try {
+      return safeEqual(Buffer.from(left), Buffer.from(right));
+    } catch {
+      return false;
+    }
+  };
+
+  // Legacy local-dev path: raw secret sent directly in a header.
+  if (secret && given === secret) return true;
+
+  const matches = (expected: string): boolean => hexEqual(expected, given);
+
+  // Current scheme (raast): sha256 over `timestamp + "." + raw_body`.
+  if (secret && timestampHeader) {
+    const keys: Buffer[] = [Buffer.from(secret)];
+    try {
+      const decoded = Buffer.from(secret, "base64");
+      if (decoded.length > 0 && !decoded.equals(Buffer.from(secret))) {
+        keys.unshift(decoded);
+      }
+    } catch {
+      /* keep raw key only */
+    }
+    for (const key of keys) {
+      const mac = createHmac("sha256", key);
+      mac.update(timestampHeader);
+      mac.update(".");
+      mac.update(rawBody);
+      if (matches(`sha256=${mac.digest("hex")}`)) return true;
+    }
+  }
+
+  const payload = parsedBody as Record<string, unknown> | undefined;
+
+  // Legacy (safepay-php `Verify`): sha512 over the serialized `data` object.
+  if (secret && payload?.data !== undefined) {
+    const mac = createHmac("sha512", Buffer.from(secret));
+    mac.update(JSON.stringify(payload.data, null, 0));
+    if (matches(mac.digest("hex"))) return true;
+  }
+
+  // `sfpy-php` SDK: sha512 over the whole body — try both the re-serialized
+  // parsed body and the exact raw bytes.
+  if (secret) {
+    const serialized = JSON.stringify(payload ?? {}, null, 0);
+    const rawText = rawBody.toString("utf8");
+    for (const bodyText of new Set([serialized, rawText])) {
+      const mac = createHmac("sha512", Buffer.from(secret));
+      mac.update(bodyText);
+      if (matches(mac.digest("hex"))) return true;
+    }
+  }
+
+  return false;
+}
+
 /** Confirm webhook via shared secret header + SafePay API tracker fetch */
 export async function processWebhookPayload(
   body: unknown,
-  signatureHeader?: string
+  signatureHeader?: string,
+  timestampHeader?: string,
+  rawBody?: Buffer
 ): Promise<{ trackerToken: string; status: "paid" | "failed" | "pending" }> {
   const env = getSafepayEnv();
 
-  if (env.webhookSecret && signatureHeader !== env.webhookSecret) {
-    throw new ApiError(401, "Invalid webhook signature", "WEBHOOK_UNAUTHORIZED");
+  if (env.webhookSecret) {
+    const verified = verifyWebhookSignature(
+      rawBody ?? Buffer.from(JSON.stringify(body ?? {})),
+      body,
+      signatureHeader,
+      timestampHeader,
+      env.webhookSecret
+    );
+    if (!verified) {
+      throw new ApiError(401, "Invalid webhook signature", "WEBHOOK_UNAUTHORIZED");
+    }
   }
 
   const trackerToken = extractTrackerFromWebhook(body);
@@ -205,11 +343,23 @@ export async function processWebhookPayload(
   const eventType = extractWebhookEventType(body).toLowerCase();
   const tracker = await fetchTrackerStatus(trackerToken);
 
-  if (eventType.includes("failed")) {
+  // Map SafePay's event catalog to our payment status. Tracker state
+  // (`TRACKER_ENDED`) is authoritative; the event type is a fast-path signal.
+  const isFailedEvent =
+    eventType.includes("failed") ||
+    eventType.includes("rejected") ||
+    eventType.includes("voided");
+
+  const isPaidEvent =
+    eventType.includes("completed") ||
+    eventType.includes("settled") ||
+    eventType.includes("succeeded");
+
+  if (isFailedEvent) {
     return { trackerToken, status: "failed" };
   }
 
-  if (tracker.paid || eventType.includes("succeeded")) {
+  if (tracker.paid || isPaidEvent) {
     return { trackerToken, status: "paid" };
   }
 
