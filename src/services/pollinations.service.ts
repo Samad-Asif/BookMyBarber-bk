@@ -1,15 +1,18 @@
 import { ApiError } from "../lib/errors";
 
 const DEFAULT_BASE_URL = "https://image.pollinations.ai";
-const DEFAULT_MODEL = "kontext";
-const REQUEST_TIMEOUT_MS = process.env.VERCEL ? 45_000 : 120_000;
+/** kontext requires enter.pollinations.ai API key — use flux on the free tier */
+const IMAGE_MODELS = ["flux", "turbo"] as const;
+const REQUEST_TIMEOUT_MS = process.env.VERCEL ? 55_000 : 120_000;
 
 function getBaseUrl(): string {
     return (process.env.POLLINATIONS_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/$/, "");
 }
 
-function getModel(): string {
-    return process.env.POLLINATIONS_IMAGE_MODEL?.trim() || DEFAULT_MODEL;
+function getModels(): string[] {
+    const preferred = process.env.POLLINATIONS_IMAGE_MODEL?.trim();
+    if (preferred) return [preferred, ...IMAGE_MODELS.filter((m) => m !== preferred)];
+    return [...IMAGE_MODELS];
 }
 
 function buildHaircutPrompt(generationPrompt: string): string {
@@ -23,9 +26,9 @@ function buildHaircutPrompt(generationPrompt: string): string {
     ].join(" ");
 }
 
-function buildGenerationUrl(prompt: string, referenceImageUrl: string): string {
+function buildGenerationUrl(prompt: string, referenceImageUrl: string, model: string): string {
     const params = new URLSearchParams();
-    params.set("model", getModel());
+    params.set("model", model);
     params.set("image", referenceImageUrl);
     params.set("width", "1024");
     params.set("height", "1024");
@@ -42,9 +45,54 @@ export function isPollinationsConfigured(): boolean {
     return true;
 }
 
+async function tryGenerateWithModel(
+    prompt: string,
+    referenceUrl: string,
+    model: string,
+): Promise<Buffer> {
+    const url = buildGenerationUrl(prompt, referenceUrl, model);
+
+    console.log("[pollinations] generating haircut image", {
+        model,
+        referenceHost: new URL(referenceUrl).hostname,
+    });
+
+    const res = await fetch(url, {
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        headers: { Accept: "image/*", "User-Agent": "BookMyBarber/1.0" },
+    });
+
+    if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        console.error("[pollinations] HTTP error", { model, status: res.status, body: body.slice(0, 300) });
+        throw new ApiError(
+            502,
+            res.status === 429
+                ? "Image service is busy. Please try again in a moment."
+                : `Image service error (${model} HTTP ${res.status})`,
+            "IMAGE_GEN_FAILED",
+        );
+    }
+
+    const contentType = res.headers.get("content-type") ?? "";
+    if (!contentType.startsWith("image/")) {
+        const body = await res.text().catch(() => "");
+        console.error("[pollinations] unexpected response type", { model, contentType, body: body.slice(0, 200) });
+        throw new ApiError(502, "Image service returned an invalid response.", "IMAGE_GEN_FAILED");
+    }
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+    if (buffer.length < 1_000) {
+        throw new ApiError(502, "Image service returned an empty image.", "IMAGE_GEN_FAILED");
+    }
+
+    console.log("[pollinations] image generated", { model, bytes: buffer.length });
+    return buffer;
+}
+
 /**
  * Generate a styled haircut image via Pollinations (image-to-image using front portrait).
- * Uses https://image.pollinations.ai with the kontext model by default.
+ * Uses flux/turbo on the free image.pollinations.ai tier (kontext needs enter.pollinations.ai key).
  */
 export async function generateHaircutImageForQueue(
     photoUrls: string[],
@@ -56,79 +104,50 @@ export async function generateHaircutImageForQueue(
     }
 
     const prompt = buildHaircutPrompt(generationPrompt || "modern flattering haircut");
-    const url = buildGenerationUrl(prompt, referenceUrl);
+    const models = getModels();
+    let lastErr: unknown;
 
-    console.log("[pollinations] generating haircut image", {
-        model: getModel(),
-        referenceHost: new URL(referenceUrl).hostname,
-    });
-
-    try {
-        const res = await fetch(url, {
-            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-            headers: { Accept: "image/*", "User-Agent": "BookMyBarber/1.0" },
-        });
-
-        if (!res.ok) {
-            const body = await res.text().catch(() => "");
-            console.error("[pollinations] HTTP error", { status: res.status, body: body.slice(0, 300) });
-            throw new ApiError(
-                502,
-                res.status === 429
-                    ? "Image service is busy. Please try again in a moment."
-                    : "Image generation service failed. Please try again.",
-                "IMAGE_GEN_FAILED",
-            );
+    for (const model of models) {
+        try {
+            return await tryGenerateWithModel(prompt, referenceUrl, model);
+        } catch (err: unknown) {
+            lastErr = err;
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes("abort") || msg.includes("timeout")) {
+                throw new ApiError(504, "Image generation timed out. Please try again.", "IMAGE_GEN_TIMEOUT");
+            }
+            console.warn("[pollinations] model failed, trying next", { model, error: msg.slice(0, 120) });
         }
-
-        const contentType = res.headers.get("content-type") ?? "";
-        if (!contentType.startsWith("image/")) {
-            const body = await res.text().catch(() => "");
-            console.error("[pollinations] unexpected response type", { contentType, body: body.slice(0, 200) });
-            throw new ApiError(502, "Image service returned an invalid response.", "IMAGE_GEN_FAILED");
-        }
-
-        const buffer = Buffer.from(await res.arrayBuffer());
-        if (buffer.length < 1_000) {
-            throw new ApiError(502, "Image service returned an empty image.", "IMAGE_GEN_FAILED");
-        }
-
-        console.log("[pollinations] image generated", { bytes: buffer.length });
-        return buffer;
-    } catch (err: unknown) {
-        if (err instanceof ApiError) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error("[pollinations] generation failed:", msg);
-        if (msg.includes("abort") || msg.includes("timeout")) {
-            throw new ApiError(504, "Image generation timed out. Please try again.", "IMAGE_GEN_TIMEOUT");
-        }
-        throw new ApiError(
-            502,
-            "Could not reach the image generation service. Please try again.",
-            "IMAGE_GEN_FAILED",
-        );
     }
+
+    if (lastErr instanceof ApiError) throw lastErr;
+    throw new ApiError(
+        502,
+        "Image generation service failed. Please try again.",
+        "IMAGE_GEN_FAILED",
+    );
 }
 
-/** Live health probe — small test generation without a reference photo. */
+/** Live health probe — flux img2img with a tiny public reference. */
 export async function checkPollinationsLive(): Promise<{
     status: "ok" | "error";
     latencyMs?: number;
     message: string;
 }> {
     const start = Date.now();
-    const testUrl = `${getBaseUrl()}/prompt/${encodeURIComponent("a simple red circle on white background")}?model=flux&width=256&height=256&nologo=true`;
+    const testRef = "https://upload.wikimedia.org/wikipedia/commons/thumb/5/5f/Portrait_of_a_man.jpg/256px-Portrait_of_a_man.jpg";
+    const testUrl = buildGenerationUrl("a simple portrait headshot", testRef, "flux");
 
     try {
         const res = await fetch(testUrl, {
             signal: AbortSignal.timeout(60_000),
-            headers: { Accept: "image/*" },
+            headers: { Accept: "image/*", "User-Agent": "BookMyBarber/1.0" },
         });
         if (!res.ok) {
             return {
                 status: "error",
                 latencyMs: Date.now() - start,
-                message: `Pollinations HTTP ${res.status}`,
+                message: `Pollinations flux HTTP ${res.status}`,
             };
         }
         const buf = Buffer.from(await res.arrayBuffer());
@@ -142,7 +161,7 @@ export async function checkPollinationsLive(): Promise<{
         return {
             status: "ok",
             latencyMs: Date.now() - start,
-            message: `Pollinations reachable (${getModel()} for haircuts)`,
+            message: "Pollinations flux img2img reachable",
         };
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);

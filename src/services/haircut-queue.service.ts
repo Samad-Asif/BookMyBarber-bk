@@ -49,6 +49,10 @@ function normalizeJobError(err: unknown): { message: string; stage: string } {
         };
     }
 
+    if (msg.includes("Image generation") || msg.includes("IMAGE_GEN") || msg.includes("Image service")) {
+        return { message: msg.length > 200 ? msg.slice(0, 200) + "…" : msg, stage: "generation" };
+    }
+
     return {
         message: msg.length > 200 ? msg.slice(0, 200) + "…" : msg,
         stage: e?.stage ?? "unknown",
