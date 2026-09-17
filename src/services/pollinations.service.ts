@@ -2,7 +2,7 @@ import { ApiError } from "../lib/errors";
 
 const DEFAULT_BASE_URL = "https://image.pollinations.ai";
 const DEFAULT_MODEL = "kontext";
-const REQUEST_TIMEOUT_MS = 120_000;
+const REQUEST_TIMEOUT_MS = process.env.VERCEL ? 45_000 : 120_000;
 
 function getBaseUrl(): string {
     return (process.env.POLLINATIONS_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/$/, "");

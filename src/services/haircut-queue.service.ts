@@ -65,7 +65,40 @@ function getApiBaseUrl(): string {
     return `http://127.0.0.1:${process.env.PORT ?? 5000}`;
 }
 
-/** Fire a dedicated serverless invocation on Vercel (or local HTTP) to process one job. */
+/** Keep the Vercel lambda alive after the HTTP response so async jobs can finish. */
+function runJobInBackground(jobId: string): void {
+    const task = processHaircutJobById(jobId).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error("[haircut-queue] background job failed", { jobId, error: msg });
+    });
+
+    if (process.env.VERCEL) {
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
+            const { waitUntil } = require("@vercel/functions") as {
+                waitUntil: (promise: Promise<unknown>) => void;
+            };
+            waitUntil(task);
+            return;
+        } catch {
+            logger.warn("[haircut-queue] waitUntil unavailable — inline process", { jobId });
+        }
+    }
+
+    void task;
+}
+
+/** Schedule one job (Vercel: waitUntil; local: optional remote dispatch + inline). */
+export function scheduleHaircutJobProcessing(jobId: string): void {
+    if (process.env.VERCEL) {
+        runJobInBackground(jobId);
+        return;
+    }
+
+    dispatchHaircutJobProcessing(jobId);
+}
+
+/** Fire a dedicated HTTP invocation (local / long-running hosts only). */
 export function dispatchHaircutJobProcessing(jobId: string): void {
     const secret = process.env.INTERNAL_CRON_SECRET ?? process.env.JWT_ACCESS_SECRET;
     if (!secret) {
@@ -90,10 +123,65 @@ export function dispatchHaircutJobProcessing(jobId: string): void {
         void processHaircutJobById(jobId);
     });
 
-    // Long-running Node servers also process inline (harmless no-op if remote wins the lock)
-    if (!process.env.VERCEL) {
-        void processHaircutJobById(jobId);
+    void processHaircutJobById(jobId);
+}
+
+/** Mark jobs stuck in progress as failed (no persistent queue worker on Vercel). */
+export async function failStuckJobs(): Promise<number> {
+    const supabase = getSupabaseSecret();
+    const cutoff = new Date(Date.now() - STUCK_TIMEOUT_MS).toISOString();
+
+    const { data: stuck } = await supabase
+        .from("haircut_requests")
+        .update({
+            status: "failed",
+            error_message: "Processing timed out. Please try again.",
+            error_stage: "timeout",
+        })
+        .in("status", ["processing", "analyzing", "queued"])
+        .lt("updated_at", cutoff)
+        .select("id, ai_analysis_id");
+
+    for (const row of stuck ?? []) {
+        if (row.ai_analysis_id) {
+            await supabase.from("ai_analyses").update({
+                status: "failed",
+                error_message: "Processing timed out. Please try again.",
+            }).eq("id", row.ai_analysis_id);
+        }
     }
+
+    return stuck?.length ?? 0;
+}
+
+/** Re-queue jobs that stalled mid-processing (e.g. Vercel lambda killed early). */
+export async function recoverStaleInProgressJobs(): Promise<number> {
+    const supabase = getSupabaseSecret();
+    const staleCutoff = new Date(Date.now() - 90_000).toISOString();
+
+    const { data: stale } = await supabase
+        .from("haircut_requests")
+        .select("id, status")
+        .in("status", ["analyzing", "processing", "queued"])
+        .lt("updated_at", staleCutoff);
+
+    let recovered = 0;
+    for (const row of stale ?? []) {
+        const { data: reset } = await supabase
+            .from("haircut_requests")
+            .update({ status: "pending" })
+            .eq("id", row.id)
+            .in("status", ["analyzing", "processing", "queued"])
+            .select("id")
+            .maybeSingle();
+
+        if (reset) {
+            scheduleHaircutJobProcessing(row.id);
+            recovered++;
+        }
+    }
+
+    return recovered;
 }
 
 /** Process one job by id (safe to call from cron, internal route, or local queue). */
@@ -200,13 +288,8 @@ async function tickQueue(): Promise<void> {
     const supabase = getSupabaseSecret();
 
     try {
-        const cutoff = new Date(Date.now() - STUCK_TIMEOUT_MS).toISOString();
-
-        await supabase
-            .from("haircut_requests")
-            .update({ status: "failed", error_message: "Processing timed out", error_stage: "timeout" })
-            .in("status", ["processing", "analyzing"])
-            .lt("updated_at", cutoff);
+        await failStuckJobs();
+        await recoverStaleInProgressJobs();
 
         const { data: pendingJobs } = await supabase
             .from("haircut_requests")

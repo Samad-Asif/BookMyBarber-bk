@@ -12,7 +12,11 @@ import {
 import { uploadImage, deleteImageByUrl } from "../../../services/cloudinary.service";
 import { getSupabaseSecret } from "../../../config/supabase";
 import { logger } from "../../../config/logger";
-import { dispatchHaircutJobProcessing } from "../../../services/haircut-queue.service";
+import {
+  scheduleHaircutJobProcessing,
+  failStuckJobs,
+  recoverStaleInProgressJobs,
+} from "../../../services/haircut-queue.service";
 
 // ── file validation ──────────────────────────────────────────────────
 
@@ -148,8 +152,8 @@ router.post(
 
     logger.info("[ai] haircut request created", { id: data.id, analysisId: analysisRecord.id, userId: req.user!.id });
 
-    // Kick off processing immediately (required on Vercel — no persistent queue worker)
-    dispatchHaircutJobProcessing(data.id);
+    // Kick off processing (waitUntil on Vercel keeps the lambda alive after 202)
+    scheduleHaircutJobProcessing(data.id);
 
     res.status(202).json({ request_id: data.id, analysis_id: analysisRecord.id, status: data.status });
   })
@@ -278,7 +282,7 @@ router.put(
 
     logger.info("[ai] analysis retried", { analysisId, requestId: data.id, userId: req.user!.id });
 
-    dispatchHaircutJobProcessing(data.id);
+    scheduleHaircutJobProcessing(data.id);
 
     res.status(202).json({ request_id: data.id, analysis_id: analysisId, status: data.status });
   })
@@ -291,6 +295,9 @@ router.get(
   authenticate,
   authorize("customer"),
   asyncHandler(async (req: Request, res: Response) => {
+    await failStuckJobs();
+    await recoverStaleInProgressJobs();
+
     const supabase = getSupabaseSecret();
     const { data, error } = await supabase
       .from("haircut_requests")
@@ -301,6 +308,11 @@ router.get(
 
     if (error || !data) {
       throw new ApiError(404, "Request not found", "NOT_FOUND");
+    }
+
+    const inProgress = ["pending", "queued", "analyzing", "processing"].includes(data.status);
+    if (inProgress) {
+      scheduleHaircutJobProcessing(data.id);
     }
 
     res.json({ request: data });
@@ -314,6 +326,9 @@ router.get(
   authenticate,
   authorize("customer"),
   asyncHandler(async (req: Request, res: Response) => {
+    await failStuckJobs();
+    await recoverStaleInProgressJobs();
+
     const supabase = getSupabaseSecret();
     const { data } = await supabase
       .from("ai_analyses")

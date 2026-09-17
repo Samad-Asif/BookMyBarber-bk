@@ -32,7 +32,7 @@ router.post(
     "/haircut-process/:id",
     asyncHandler(async (req: Request, res: Response) => {
         requireInternalSecret(req);
-        const { id } = req.params;
+        const id = String(req.params.id);
         await processHaircutJobById(id);
         res.json({ ok: true, id });
     }),
