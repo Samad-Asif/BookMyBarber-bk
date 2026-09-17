@@ -11,10 +11,5 @@
       "path": "/v1/internal/haircut-queue/tick",
       "schedule": "* * * * *"
     }
-  ],
-  "functions": {
-    "src/index.ts": {
-      "maxDuration": 300
-    }
-  }
+  ]
 }
