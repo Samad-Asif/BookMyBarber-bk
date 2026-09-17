@@ -262,10 +262,7 @@ async function processJob(
     let imgBuf = imageBuffer;
     if (!imgBuf) {
         logger.warn("[haircut-queue] no image from pipeline — retrying image-only", { id });
-        imgBuf = await generateHaircutImageForQueue(
-            imageUrls,
-            analysis.generation_prompt || analysis.suggested_haircut,
-        );
+        imgBuf = await generateHaircutImageForQueue(imageUrls, analysis.generation_prompt || analysis.suggested_haircut);
     }
 
     if (!imgBuf) {
@@ -274,7 +271,7 @@ async function processJob(
         throw err;
     }
 
-    const uploaded = await uploadImage(imgBuf, "image/png", "haircut-generations");
+    const uploaded = await uploadImage(imgBuf, "image/jpeg", "haircut-generations");
 
     await supabase
         .from("haircut_requests")

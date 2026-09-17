@@ -3,6 +3,7 @@ import sharp from "sharp";
 import { getSupabaseSecret } from "../config/supabase";
 import { ApiError } from "../lib/errors";
 import { uploadImage } from "./cloudinary.service";
+import { generateHaircutImageForQueue as generateHaircutViaPollinations } from "./pollinations.service";
 
 // ── configuration ───────────────────────────────────────────────────
 
@@ -768,14 +769,8 @@ export async function runHaircutPipeline(
 
     const analysis = await runTextAnalysisOnly(photoUrls, customerPrompt);
     const generationPrompt = analysis.generation_prompt || analysis.suggested_haircut;
-
-    try {
-        const imageBuffer = await generateHaircutImageForQueue(photoUrls, generationPrompt);
-        return { analysis, imageBuffer };
-    } catch (err) {
-        console.error("[gemini] image generation failed after text analysis:", err);
-        return { analysis, imageBuffer: null };
-    }
+    const imageBuffer = await generateHaircutViaPollinations(photoUrls, generationPrompt);
+    return { analysis, imageBuffer };
 }
 
 /** @deprecated Use runHaircutPipeline — kept for backwards compatibility */
@@ -786,55 +781,8 @@ export async function runAnalysisPipeline(
     return analysis;
 }
 
-/**
- * Public wrapper for the queue worker — fetches images, generates haircut image.
- * Returns a PNG Buffer on success, null on failure.
- */
-export async function generateHaircutImageForQueue(
-    photoUrls: string[],
-    generationPrompt: string,
-    _resolution: OutputResolution = "1K",
-): Promise<Buffer | null> {
-    const images = await fetchImages(photoUrls as [string, string, string]);
-    const prompt = `Using the person from these 3 reference photos (front, left, right angles), generate a single professional headshot.
-
-CRITICAL — DO NOT CHANGE:
-- Face structure, shape, or proportions
-- Skin tone, complexion, or undertone
-- Eye shape, color, or expression
-- Nose, lips, jawline, or any facial feature
-- Age appearance
-- Ethnicity or racial features
-
-ONLY CHANGE THE HAIR:
-- Apply the haircut described below to the person's HEAD hair AND/OR facial hair (beard, mustache) as specified
-- Keep everything else exactly the same as the reference photos
-
-Apply this haircut: ${generationPrompt}
-
-Image requirements:
-- Background: Clean professional studio gradient (soft blue-grey)
-- Lighting: Even, flattering studio lighting
-- Expression: Natural, confident — same as reference photos
-- Resolution: High quality, photorealistic
-- The haircut must be clearly visible and well-defined
-- Do NOT stylize or cartoon-ify — this must look like a real photo
-- The person must look IDENTICAL to the reference photos except for the hair change`;
-
-    const result = await withPipelineModelChain(async (model) => {
-        const ai = getClient();
-        const response = await ai.models.generateContent({
-            model,
-            contents: [{ role: "user", parts: [{ text: prompt }, ...toGeminiParts(images)] }],
-            config: {
-                responseModalities: ["IMAGE"],
-            },
-        });
-        return extractGeneratedImage(response);
-    }, "imageGen");
-
-    return result;
-}
+/** @deprecated Use pollinations.service — re-exported for existing imports */
+export { generateHaircutImageForQueue } from "./pollinations.service";
 
 /**
  * Full pipeline: validate + analyze + generate image in one step.
@@ -850,13 +798,13 @@ export async function analyzeAndGenerate(params: {
         throw new ApiError(503, "Gemini AI is not configured", "NOT_CONFIGURED");
     }
 
-    const { analysis, imageBuffer } = await runSingleStepPipeline(params.photoUrls, params.customerPrompt);
-    console.log("[gemini] single-step pipeline completed");
+    const { analysis, imageBuffer } = await runHaircutPipeline(params.photoUrls, params.customerPrompt);
+    console.log("[gemini] analysis + Pollinations image pipeline completed");
 
     let generatedImageUrl: string | null = null;
     if (imageBuffer) {
         try {
-            const uploaded = await uploadImage(imageBuffer, "image/png", "haircut-generations");
+            const uploaded = await uploadImage(imageBuffer, "image/jpeg", "haircut-generations");
             generatedImageUrl = uploaded.secureUrl;
         } catch (err) {
             console.error("[gemini] image upload failed:", err);

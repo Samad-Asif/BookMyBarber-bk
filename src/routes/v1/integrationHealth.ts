@@ -1,5 +1,6 @@
 import { isCloudinaryConfigured, getCloudinary } from "../../config/cloudinary";
 import { isGeminiConfigured } from "../../services/gemini.service";
+import { checkPollinationsLive } from "../../services/pollinations.service";
 import { GoogleGenAI } from "@google/genai";
 
 type CheckStatus = "ok" | "degraded" | "error" | "skipped";
@@ -149,14 +150,24 @@ function checkApiBaseUrl(): IntegrationCheck {
   };
 }
 
-function checkGeminiImageModel(): IntegrationCheck {
+function checkGeminiAnalysis(): IntegrationCheck {
   if (!isGeminiConfigured()) {
     return { status: "skipped", configured: false, message: "Skipped — no Gemini key" };
   }
   return {
     status: "ok",
     configured: true,
-    message: "Gemini configured for AI Style Guide pipeline",
+    message: "Gemini configured for face/hair text analysis",
+  };
+}
+
+async function checkPollinations(): Promise<IntegrationCheck> {
+  const result = await checkPollinationsLive();
+  return {
+    status: result.status,
+    configured: true,
+    latencyMs: result.latencyMs,
+    message: result.message,
   };
 }
 
@@ -174,10 +185,11 @@ export async function runIntegrationHealthChecks(): Promise<{
   timestamp: string;
   integrations: Record<string, IntegrationCheck>;
 }> {
-  const [gemini, cloudinary, geminiFlag, cloudinaryFlag] = await Promise.all([
+  const [gemini, cloudinary, pollinations, geminiFlag, cloudinaryFlag] = await Promise.all([
     checkGeminiLive(),
     checkCloudinaryLive(),
-    Promise.resolve(checkGeminiImageModel()),
+    checkPollinations(),
+    Promise.resolve(checkGeminiAnalysis()),
     Promise.resolve(checkCloudinaryFlag()),
   ]);
 
@@ -188,10 +200,11 @@ export async function runIntegrationHealthChecks(): Promise<{
   const integrations = {
     gemini,
     cloudinary,
+    pollinations,
     supabaseJwt,
     cron,
     apiBaseUrl,
-    geminiConfigured: geminiFlag,
+    geminiAnalysis: geminiFlag,
     cloudinaryConfigured: cloudinaryFlag,
   };
 
