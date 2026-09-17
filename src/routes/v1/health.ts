@@ -5,6 +5,7 @@ import {
   isSupabaseConfigured,
 } from "../../config/supabase";
 import { logger } from "../../config/logger";
+import { runIntegrationHealthChecks } from "./integrationHealth";
 
 const router = Router();
 
@@ -129,6 +130,18 @@ router.get("/", async (_req: Request, res: Response) => {
     },
     checks,
   });
+});
+
+/** Live probe of AI / Cloudinary / cron env vars (no secrets exposed). */
+router.get("/integrations", async (_req: Request, res: Response) => {
+  try {
+    const report = await runIntegrationHealthChecks();
+    res.status(report.status === "error" ? 503 : 200).json(report);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Integration check failed";
+    logger.error("Integration health check failed", { message });
+    res.status(500).json({ status: "error", message });
+  }
 });
 
 export default router;
