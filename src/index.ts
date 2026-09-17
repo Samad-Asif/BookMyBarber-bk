@@ -92,7 +92,10 @@ app.get("/", (_req, res) => {
 app.use("/v1", v1Router);
 app.use(errorHandler);
 
-app.listen(PORT, "0.0.0.0", () => {
+/** Vercel serverless + local dev entry */
+export default app;
+
+function bootLocalServer(): void {
   const sb = getSupabaseConfig();
   console.log(`[BookMyBarber] API listening on port ${PORT}`);
   logger.info(`BookMyBarber API listening on http://0.0.0.0:${PORT}`);
@@ -104,8 +107,11 @@ app.listen(PORT, "0.0.0.0", () => {
   });
   logger.info("SafePay", { configured: isSafepayConfigured() });
 
-  // Start haircut generation queue worker (polls for pending jobs)
   startHaircutQueue();
-  // Auto-cancel unpaid bookings past payment_due_at
   startUnpaidBookingExpirySweep();
-});
+}
+
+// Local `npm run dev` — long-running process with interval queue
+if (require.main === module) {
+  app.listen(PORT, "0.0.0.0", bootLocalServer);
+}

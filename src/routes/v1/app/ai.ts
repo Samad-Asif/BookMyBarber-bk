@@ -12,6 +12,7 @@ import {
 import { uploadImage, deleteImageByUrl } from "../../../services/cloudinary.service";
 import { getSupabaseSecret } from "../../../config/supabase";
 import { logger } from "../../../config/logger";
+import { dispatchHaircutJobProcessing } from "../../../services/haircut-queue.service";
 
 // ── file validation ──────────────────────────────────────────────────
 
@@ -146,6 +147,10 @@ router.post(
     }
 
     logger.info("[ai] haircut request created", { id: data.id, analysisId: analysisRecord.id, userId: req.user!.id });
+
+    // Kick off processing immediately (required on Vercel — no persistent queue worker)
+    dispatchHaircutJobProcessing(data.id);
+
     res.status(202).json({ request_id: data.id, analysis_id: analysisRecord.id, status: data.status });
   })
 );
@@ -272,6 +277,9 @@ router.put(
     }
 
     logger.info("[ai] analysis retried", { analysisId, requestId: data.id, userId: req.user!.id });
+
+    dispatchHaircutJobProcessing(data.id);
+
     res.status(202).json({ request_id: data.id, analysis_id: analysisId, status: data.status });
   })
 );
@@ -313,7 +321,72 @@ router.get(
       .eq("customer_id", req.user!.id)
       .order("created_at", { ascending: false })
       .limit(20);
-    res.json({ analyses: data ?? [] });
+
+    const rows = data ?? [];
+    const analysisIds = rows.map((r) => r.id);
+
+    let requestByAnalysis = new Map<string, Record<string, unknown>>();
+    if (analysisIds.length > 0) {
+      const { data: requests } = await supabase
+        .from("haircut_requests")
+        .select("id, ai_analysis_id, status, result_image_url, error_message, haircut_title, stylist_recommendation, face_shape, created_at")
+        .in("ai_analysis_id", analysisIds)
+        .order("created_at", { ascending: false });
+
+      for (const hr of requests ?? []) {
+        if (hr.ai_analysis_id && !requestByAnalysis.has(hr.ai_analysis_id)) {
+          requestByAnalysis.set(hr.ai_analysis_id, hr);
+        }
+      }
+    }
+
+    const analyses = rows.map((row) => {
+      const hr = requestByAnalysis.get(row.id);
+      if (!hr) return row;
+
+      const hrStatus = String(hr.status ?? "");
+      const inProgress = ["pending", "queued", "analyzing", "processing"].includes(hrStatus);
+
+      return {
+        ...row,
+        request_id: hr.id,
+        face_shape: row.face_shape || hr.face_shape || "",
+        suggested_haircut: inProgress
+          ? "Analyzing..."
+          : hrStatus === "failed"
+            ? "Analysis failed"
+            : row.suggested_haircut || hr.haircut_title || "",
+        styling_reason: row.styling_reason ?? hr.stylist_recommendation ?? null,
+        generated_image_url: row.generated_image_url ?? hr.result_image_url ?? null,
+        error_message: row.error_message ?? hr.error_message ?? null,
+        status: inProgress ? hrStatus : row.status,
+      };
+    });
+
+    res.json({ analyses });
+  })
+);
+
+// ── GET /analyses/:id — single analysis (retake screen) ──────────────
+
+router.get(
+  "/analyses/:id",
+  authenticate,
+  authorize("customer"),
+  asyncHandler(async (req: Request, res: Response) => {
+    const supabase = getSupabaseSecret();
+    const { data, error } = await supabase
+      .from("ai_analyses")
+      .select("*")
+      .eq("id", req.params.id)
+      .eq("customer_id", req.user!.id)
+      .single();
+
+    if (error || !data) {
+      throw new ApiError(404, "Analysis not found", "NOT_FOUND");
+    }
+
+    res.json({ analysis: data });
   })
 );
 
