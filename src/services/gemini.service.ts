@@ -8,14 +8,20 @@ import { uploadImage } from "./cloudinary.service";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
 
-/** Single-step pipeline models — image+text in, image+text out (free tier) */
+/** Image generation models */
 const PIPELINE_MODELS = [
-    "gemini-3.1-flash-image",   // primary, ~10 RPM / ~500 RPD free tier
-    "gemini-2.5-flash-image",   // fallback, same free tier pool
+    "gemini-2.5-flash-image",
+    "gemini-2.0-flash-preview-image-generation",
+];
+
+/** Face/hair analysis — text-only (fast, reliable) */
+const ANALYSIS_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
 ];
 
 /** Text-only chat models */
-const CHAT_MODELS = ["gemini-3.5-flash", "gemini-3.6-flash"];
+const CHAT_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"];
 
 const MAX_RETRIES_PER_MODEL = 3;
 const BASE_DELAY_MS = 1_000;
@@ -203,8 +209,27 @@ async function compressImage(buf: Buffer): Promise<Buffer> {
 
 async function fetchImages(urls: string[]): Promise<FetchedImage[]> {
     return Promise.all(
-        urls.map(async (url) => {
-            const res = await fetch(url);
+        urls.map(async (url, index) => {
+            const label = ["front", "left side", "right side"][index] ?? `photo ${index + 1}`;
+            let res: Response;
+            try {
+                res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                console.error(`[gemini] fetchImages failed (${label}):`, msg);
+                throw new ApiError(
+                    502,
+                    `Could not load ${label} photo for AI analysis. Please re-upload and try again.`,
+                    "AI_UNAVAILABLE",
+                );
+            }
+            if (!res.ok) {
+                throw new ApiError(
+                    502,
+                    `Photo (${label}) is unavailable (${res.status}). Please re-upload and try again.`,
+                    "AI_UNAVAILABLE",
+                );
+            }
             let buf: Buffer = Buffer.from(await res.arrayBuffer());
             buf = await compressImage(buf);
             const base64 = buf.toString("base64");
@@ -292,6 +317,37 @@ async function withPipelineModelChain<T>(
  * Same as withPipelineModelChain but returns error info instead of throwing.
  * Used by the batch queue fallback path.
  */
+async function withAnalysisModelChain<T>(
+    fn: (modelName: string) => Promise<T>,
+    label: string,
+): Promise<T> {
+    let lastErr: unknown;
+    for (const modelName of ANALYSIS_MODELS) {
+        for (let attempt = 0; attempt < MAX_RETRIES_PER_MODEL; attempt++) {
+            try {
+                console.log(`[gemini] ${label} trying ${modelName} (attempt ${attempt + 1})`);
+                return await fn(modelName);
+            } catch (err: unknown) {
+                lastErr = err;
+                const info = parseRateLimitInfo(err);
+                if (!info.rateLimited) throwGeminiError(err);
+                if (info.isDailyQuota) {
+                    throw new ApiError(
+                        429,
+                        "AI daily usage limit has been reached. Please try again tomorrow.",
+                        "DAILY_QUOTA_EXHAUSTED",
+                    );
+                }
+                const delay = (info.retryAfterMs && info.retryAfterMs < 60_000)
+                    ? info.retryAfterMs
+                    : backoff(attempt);
+                await sleep(delay);
+            }
+        }
+    }
+    throw lastErr ?? new ApiError(503, "AI analysis models unavailable", "AI_UNAVAILABLE");
+}
+
 async function withPipelineModelChainSafe<T>(
     fn: (modelName: string) => Promise<T>,
     label: string,
@@ -400,8 +456,80 @@ export function stopBatchProcessor() {
     }
 }
 
-// ── Single-step pipeline: validation + analysis + image generation ───
+// ── Two-phase pipeline: text analysis, then image generation ────────
 
+const TEXT_ANALYSIS_PROMPT = (customerPrompt?: string) => `You are a professional barber and hair stylist AI. You will receive 3 portrait photos of the same person.
+
+Photo 1 = FRONT view (face facing camera)
+Photo 2 = LEFT SIDE view (head turned left)
+Photo 3 = RIGHT SIDE view (head turned right)
+
+Analyze each photo and respond with ONLY a JSON object (no markdown, no code fences):
+{"valid":true,"photos":[{"index":0,"valid":true,"reason":""},{"index":1,"valid":true,"reason":""},{"index":2,"valid":true,"reason":""}],"all_same_person":true,"all_same_person_reason":"","face_shape":"oval|round|square|heart|oblong","hair_density":"thick|medium|thin|receding","hair_texture":"straight|wavy|curly|coily","hair_color":"description","suggested_haircut":"haircut name","styling_reason":"2-3 sentences why this suits them","analysis_details":"1-2 sentences about face/hair observations","generation_prompt":"detailed prompt describing the recommended haircut to apply to this person"}
+
+Validation rules:
+- Exactly ONE clearly visible human face per photo
+- Well-lit, sharp, not occluded (no sunglasses/masks/hats covering face)
+- All 3 photos must be the same person
+- Set valid=false with reason if any photo fails
+
+Customer request: ${customerPrompt ?? "Suggest a modern flattering haircut"}`;
+
+async function runTextAnalysisOnly(
+    photoUrls: [string, string, string],
+    customerPrompt?: string,
+): Promise<AnalysisResult> {
+    const images = await fetchImages(photoUrls);
+    const prompt = TEXT_ANALYSIS_PROMPT(customerPrompt);
+
+    const text = await withAnalysisModelChain(async (model) => {
+        const ai = getClient();
+        const response = await ai.models.generateContent({
+            model,
+            contents: [{ role: "user", parts: [{ text: prompt }, ...toGeminiParts(images)] }],
+        });
+        return response.text ?? "";
+    }, "textAnalysis");
+
+    let analysisData: Record<string, unknown>;
+    try {
+        analysisData = extractJson(text);
+    } catch {
+        console.error("[gemini] failed to parse text analysis JSON:", text.slice(0, 500));
+        throw new ApiError(502, "AI returned invalid analysis data. Please try again.", "AI_UNAVAILABLE");
+    }
+
+    if (analysisData.valid === false || analysisData.all_same_person === false) {
+        if (!analysisData.valid) {
+            const invalidPhotos = ((analysisData.photos as { valid?: boolean; index?: number; reason?: string }[]) ?? []).filter((p) => !p.valid);
+            if (invalidPhotos.length > 0) {
+                const p = invalidPhotos[0];
+                const label = ["front", "left side", "right side"][p.index ?? 0] ?? `photo ${(p.index ?? 0) + 1}`;
+                throw new ApiError(400, `Photo ${(p.index ?? 0) + 1} (${label}): ${p.reason ?? "invalid"}`, "INVALID_PHOTOS");
+            }
+        }
+        if (analysisData.all_same_person === false) {
+            throw new ApiError(
+                400,
+                `The 3 photos don't appear to be the same person: ${analysisData.all_same_person_reason ?? "different people detected"}`,
+                "INVALID_PHOTOS",
+            );
+        }
+    }
+
+    return {
+        face_shape: String(analysisData.face_shape ?? "oval"),
+        hair_density: String(analysisData.hair_density ?? "medium"),
+        hair_texture: String(analysisData.hair_texture ?? "straight"),
+        hair_color: String(analysisData.hair_color ?? "dark brown"),
+        suggested_haircut: String(analysisData.suggested_haircut ?? "Classic Cut"),
+        styling_reason: String(analysisData.styling_reason ?? ""),
+        analysis_details: String(analysisData.analysis_details ?? ""),
+        generation_prompt: String(analysisData.generation_prompt ?? analysisData.suggested_haircut ?? "modern flattering haircut"),
+    };
+}
+
+// Legacy single-step prompt (kept for batch retry path)
 const COMBINED_PROMPT = (customerPrompt?: string) => `You are a professional barber and hair stylist AI. You will receive 3 portrait photos of the same person.
 
 Photo 1 = FRONT view (face facing camera)
@@ -626,13 +754,34 @@ export interface AnalysisResult {
 }
 
 /**
- * Run analysis pipeline — returns analysis JSON only (no image generation).
- * Used by the async queue flow where analysis and generation are separate steps.
+ * Run the haircut pipeline — text analysis then image generation (two reliable steps).
+ * Used by the async queue worker.
  */
+export async function runHaircutPipeline(
+    photoUrls: [string, string, string],
+    customerPrompt?: string,
+): Promise<{ analysis: AnalysisResult; imageBuffer: Buffer | null }> {
+    if (!isGeminiConfigured()) {
+        throw new ApiError(503, "Gemini AI is not configured", "NOT_CONFIGURED");
+    }
+
+    const analysis = await runTextAnalysisOnly(photoUrls, customerPrompt);
+    const generationPrompt = analysis.generation_prompt || analysis.suggested_haircut;
+
+    try {
+        const imageBuffer = await generateHaircutImageForQueue(photoUrls, generationPrompt);
+        return { analysis, imageBuffer };
+    } catch (err) {
+        console.error("[gemini] image generation failed after text analysis:", err);
+        return { analysis, imageBuffer: null };
+    }
+}
+
+/** @deprecated Use runHaircutPipeline — kept for backwards compatibility */
 export async function runAnalysisPipeline(
     photoUrls: [string, string, string],
 ): Promise<AnalysisResult> {
-    const { analysis } = await runSingleStepPipeline(photoUrls);
+    const { analysis } = await runHaircutPipeline(photoUrls);
     return analysis;
 }
 
@@ -643,11 +792,10 @@ export async function runAnalysisPipeline(
 export async function generateHaircutImageForQueue(
     photoUrls: string[],
     generationPrompt: string,
-    resolution: OutputResolution = "1K",
+    _resolution: OutputResolution = "1K",
 ): Promise<Buffer | null> {
-    try {
-        const images = await fetchImages(photoUrls as [string, string, string]);
-        const prompt = `Using the person from these 3 reference photos (front, left, right angles), generate a single professional headshot.
+    const images = await fetchImages(photoUrls as [string, string, string]);
+    const prompt = `Using the person from these 3 reference photos (front, left, right angles), generate a single professional headshot.
 
 CRITICAL — DO NOT CHANGE:
 - Face structure, shape, or proportions
@@ -672,23 +820,19 @@ Image requirements:
 - Do NOT stylize or cartoon-ify — this must look like a real photo
 - The person must look IDENTICAL to the reference photos except for the hair change`;
 
-        const result = await withPipelineModelChain(async (model) => {
-            const ai = getClient();
-            const response = await ai.models.generateContent({
-                model,
-                contents: [{ role: "user", parts: [{ text: prompt }, ...toGeminiParts(images)] }],
-                config: {
-                    responseModalities: ["IMAGE"],
-                },
-            });
-            return extractGeneratedImage(response);
-        }, "imageGen");
+    const result = await withPipelineModelChain(async (model) => {
+        const ai = getClient();
+        const response = await ai.models.generateContent({
+            model,
+            contents: [{ role: "user", parts: [{ text: prompt }, ...toGeminiParts(images)] }],
+            config: {
+                responseModalities: ["IMAGE"],
+            },
+        });
+        return extractGeneratedImage(response);
+    }, "imageGen");
 
-        return result;
-    } catch (err) {
-        console.error("[gemini] generateHaircutImageForQueue failed:", err);
-        return null;
-    }
+    return result;
 }
 
 /**
