@@ -49,6 +49,23 @@ function sleep(ms: number): Promise<void> {
     return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Pose/angle mismatches should not block analysis — only hard quality issues. */
+function isSoftPoseRejection(reason: string): boolean {
+    const r = reason.toLowerCase();
+    return (
+        r.includes("front view") ||
+        r.includes("side view") ||
+        r.includes("left side") ||
+        r.includes("right side") ||
+        r.includes("profile") ||
+        r.includes("turned") ||
+        r.includes("angle") ||
+        r.includes("pose") ||
+        r.includes("not a left") ||
+        r.includes("not a right")
+    );
+}
+
 function backoff(attempt: number): number {
     const delay = Math.min(60_000, BASE_DELAY_MS * Math.pow(2, attempt));
     const jitter = Math.random() * 1_000;
@@ -469,11 +486,12 @@ Photo 3 = RIGHT SIDE view (head turned right)
 Analyze each photo and respond with ONLY a JSON object (no markdown, no code fences):
 {"valid":true,"photos":[{"index":0,"valid":true,"reason":""},{"index":1,"valid":true,"reason":""},{"index":2,"valid":true,"reason":""}],"all_same_person":true,"all_same_person_reason":"","face_shape":"oval|round|square|heart|oblong","hair_density":"thick|medium|thin|receding","hair_texture":"straight|wavy|curly|coily","hair_color":"description","suggested_haircut":"haircut name","styling_reason":"2-3 sentences why this suits them","analysis_details":"1-2 sentences about face/hair observations","generation_prompt":"detailed prompt describing the recommended haircut to apply to this person"}
 
-Validation rules:
+Validation rules (IMPORTANT):
 - Exactly ONE clearly visible human face per photo
 - Well-lit, sharp, not occluded (no sunglasses/masks/hats covering face)
 - All 3 photos must be the same person
-- Set valid=false with reason if any photo fails
+- Do NOT reject photos for pose angle alone — accept front-facing, 3/4, or profile views even if the labeled slot is not a perfect side profile
+- Only set valid=false for: no visible face, extreme blur/darkness, face covered, cartoon/illustration, or clearly different people
 
 Customer request: ${customerPrompt ?? "Suggest a modern flattering haircut"}`;
 
@@ -504,10 +522,13 @@ async function runTextAnalysisOnly(
     if (analysisData.valid === false || analysisData.all_same_person === false) {
         if (!analysisData.valid) {
             const invalidPhotos = ((analysisData.photos as { valid?: boolean; index?: number; reason?: string }[]) ?? []).filter((p) => !p.valid);
+            const hardFail = invalidPhotos.find((p) => !isSoftPoseRejection(p.reason ?? ""));
+            if (hardFail) {
+                const label = ["front", "left side", "right side"][hardFail.index ?? 0] ?? `photo ${(hardFail.index ?? 0) + 1}`;
+                throw new ApiError(400, `Photo ${(hardFail.index ?? 0) + 1} (${label}): ${hardFail.reason ?? "invalid"}`, "INVALID_PHOTOS");
+            }
             if (invalidPhotos.length > 0) {
-                const p = invalidPhotos[0];
-                const label = ["front", "left side", "right side"][p.index ?? 0] ?? `photo ${(p.index ?? 0) + 1}`;
-                throw new ApiError(400, `Photo ${(p.index ?? 0) + 1} (${label}): ${p.reason ?? "invalid"}`, "INVALID_PHOTOS");
+                console.warn("[gemini] ignoring soft pose validation:", invalidPhotos.map((p) => p.reason));
             }
         }
         if (analysisData.all_same_person === false) {
