@@ -10,18 +10,19 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
 
 /** Image generation models */
 const PIPELINE_MODELS = [
+    "gemini-3.1-flash-image-preview",
+    "gemini-3-pro-image-preview",
     "gemini-2.5-flash-image",
-    "gemini-2.0-flash-preview-image-generation",
 ];
 
 /** Face/hair analysis — text-only (fast, reliable) */
 const ANALYSIS_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
 ];
 
 /** Text-only chat models */
-const CHAT_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"];
+const CHAT_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash"];
 
 const MAX_RETRIES_PER_MODEL = 3;
 const BASE_DELAY_MS = 1_000;
