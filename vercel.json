@@ -5,11 +5,5 @@
   ],
   "routes": [
     { "src": "/(.*)", "dest": "src/index.ts" }
-  ],
-  "crons": [
-    {
-      "path": "/v1/internal/haircut-queue/tick",
-      "schedule": "* * * * *"
-    }
   ]
 }
