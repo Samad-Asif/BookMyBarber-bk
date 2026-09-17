@@ -374,7 +374,7 @@ router.get(
         styling_reason: row.styling_reason ?? hr.stylist_recommendation ?? null,
         generated_image_url: row.generated_image_url ?? hr.result_image_url ?? null,
         error_message: row.error_message ?? hr.error_message ?? null,
-        status: inProgress ? hrStatus : row.status,
+        status: inProgress ? hrStatus : hrStatus || row.status,
       };
     });
 
