@@ -83,6 +83,10 @@ router.use("/loyalty", loyaltyRouter);
  * ----------------------------------------------------
  */
 
+/** Client-safe columns only — profiles also holds password_hash, OAuth ids and lockout/OTP counters. */
+const CLIENT_PROFILE_SELECT =
+  "id, email, name, phone, role, city, avatar_url, created_at, updated_at, loyalty_tier, lifetime_spend_pkr, loyalty_updated_at";
+
 /** GET /v1/app/profile — authenticated customer or barber */
 router.get(
   "/profile",
@@ -94,7 +98,7 @@ router.get(
     const supabase = getSupabaseSecret();
     const { data, error } = await supabase
       .from("profiles")
-      .select("*")
+      .select(CLIENT_PROFILE_SELECT)
       .eq("id", req.user.id)
       .single();
 
@@ -132,7 +136,7 @@ router.put(
       .from("profiles")
       .update(patch)
       .eq("id", req.user.id)
-      .select()
+      .select(CLIENT_PROFILE_SELECT)
       .single();
 
     if (error) {
