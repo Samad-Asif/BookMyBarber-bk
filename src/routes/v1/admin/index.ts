@@ -4,6 +4,9 @@ import { asyncHandler } from "../../../middleware/asyncHandler";
 import { getSupabaseSecret } from "../../../config/supabase";
 import { ApiError } from "../../../lib/errors";
 import { adminBookingsQuerySchema } from "../../../schemas/booking";
+import { uuidSchema } from "../../../schemas/admin";
+import { param } from "../../../lib/params";
+import { logger } from "../../../config/logger";
 import barbersRouter from "./barbers";
 import loyaltyRouter from "./loyalty";
 import emailRouter from "./email";
@@ -248,6 +251,56 @@ router.post(
     }
 
     res.json({ message: "Barber shop registration rejected", shop: data?.[0] });
+  })
+);
+
+/** Runs admin_delete_shop(); dryRun only reports what would be removed. */
+async function runShopDelete(req: Request, dryRun: boolean) {
+  const parsed = uuidSchema.safeParse(param(req, "id"));
+  if (!parsed.success) {
+    throw new ApiError(400, "Invalid shop id", "VALIDATION_ERROR");
+  }
+
+  const supabase = getSupabaseSecret();
+  const { data, error } = await supabase.rpc("admin_delete_shop", {
+    p_shop_id: parsed.data,
+    p_admin_id: req.user!.id,
+    p_dry_run: dryRun,
+  });
+
+  if (error) {
+    if (error.code === "P0002") throw new ApiError(404, "Shop not found", "NOT_FOUND");
+    logger.error("Admin shop delete failed", {
+      shopId: parsed.data,
+      adminId: req.user!.id,
+      dryRun,
+      code: error.code,
+      message: error.message,
+    });
+    throw new ApiError(500, `Could not delete shop: ${error.message}`, "DELETE_FAILED");
+  }
+  return data;
+}
+
+/** GET /v1/admin/shops/:id/deletion-impact — what deleting this shop would remove */
+router.get(
+  "/shops/:id/deletion-impact",
+  asyncHandler(async (req: Request, res: Response) => {
+    res.json({ impact: await runShopDelete(req, true) });
+  })
+);
+
+/**
+ * DELETE /v1/admin/shops/:id — permanently delete one shop with its team,
+ * services, hours, bookings, reviews and chats. The owner's barber account
+ * stays; customer payments are kept. Recorded in admin_audit_log.
+ */
+router.delete(
+  "/shops/:id",
+  asyncHandler(async (req: Request, res: Response) => {
+    const summary = await runShopDelete(req, false);
+    logger.info("Admin deleted shop", { adminId: req.user!.id, summary });
+    res.json({ message: "Shop deleted permanently", summary });
   })
 );
 
