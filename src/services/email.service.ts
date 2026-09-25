@@ -1,144 +1,430 @@
 import nodemailer from "nodemailer";
-import { loadMailEnv, isMailConfigured } from "../config/mailEnv";
+import type { Transporter } from "nodemailer";
+import { loadMailEnv, missingMailEnv, type MailEnvConfig } from "../config/mailEnv";
+import { getSupabaseSecret } from "../config/supabase";
 import { ApiError } from "../lib/errors";
 import { logger } from "../config/logger";
+import {
+  renderAccountLockedEmail,
+  renderBookingConfirmationEmail,
+  renderPasswordResetCodeEmail,
+  renderPaymentReceiptEmail,
+  renderTestEmail,
+  renderVerificationCodeEmail,
+  type BookingEmailContext,
+  type LoyaltyEmailInfo,
+  type PaymentEmailInfo,
+  type RenderedEmail,
+} from "./email-templates";
 
-let transporter: nodemailer.Transporter | null = null;
+export type EmailKind =
+  | "verification_code"
+  | "password_reset"
+  | "account_locked"
+  | "booking_confirmation"
+  | "payment_receipt"
+  | "test";
 
-function getTransporter(): nodemailer.Transporter {
-  if (transporter) return transporter;
-  const env = loadMailEnv();
-  if (!isMailConfigured()) {
-    throw new ApiError(500, "SMTP email not configured", "AUTH_CONFIG_ERROR");
+export type SendEmailResult =
+  | { status: "sent"; messageId: string | null }
+  | { status: "skipped"; reason: "duplicate" }
+  | { status: "dry_run" };
+
+/**
+ * Send failure. Clients only see the generic message/code; `reason` (the SMTP
+ * diagnosis) is kept server-side for logs and the admin dashboard.
+ */
+export class EmailDeliveryError extends ApiError {
+  constructor(
+    statusCode: number,
+    message: string,
+    public readonly reason: string
+  ) {
+    super(statusCode, message, "EMAIL_FAILED");
+    this.name = "EmailDeliveryError";
   }
-  transporter = nodemailer.createTransport({
-    service: "gmail",
-    auth: { user: env.user, pass: env.pass },
-  });
+}
+
+export interface SmtpVerifyResult {
+  ok: boolean;
+  configured: boolean;
+  missing?: string[];
+  latencyMs?: number;
+  error?: string;
+  checkedAt: string;
+}
+
+// Vercel functions run for at most 60s — never let a stuck SMTP handshake
+// consume the whole request (nodemailer's defaults are minutes long).
+const SMTP_TIMEOUTS = {
+  connectionTimeout: 10_000,
+  greetingTimeout: 10_000,
+  socketTimeout: 20_000,
+};
+
+/** A 'sending' row older than this is treated as a crashed attempt. */
+const STALE_SENDING_MS = 10 * 60_000;
+const MAX_ATTEMPTS = 5;
+
+let cachedTransport: { key: string; transporter: Transporter } | null = null;
+let verifyCache: { key: string; at: number; result: SmtpVerifyResult } | null = null;
+
+function transportKey(env: MailEnvConfig): string {
+  return [env.transport, env.host, env.port, env.secure, env.user, env.pass].join("|");
+}
+
+function getTransporter(env: MailEnvConfig): Transporter {
+  const key = transportKey(env);
+  if (cachedTransport?.key === key) return cachedTransport.transporter;
+
+  const auth = { user: env.user, pass: env.pass };
+  const transporter = env.host
+    ? nodemailer.createTransport({
+        host: env.host,
+        port: env.port ?? (env.secure ? 465 : 587),
+        secure: env.secure,
+        auth,
+        ...SMTP_TIMEOUTS,
+      })
+    : nodemailer.createTransport({ service: "gmail", auth, ...SMTP_TIMEOUTS });
+
+  cachedTransport = { key, transporter };
   return transporter;
 }
 
-export function validateEmailConfig(): void {
+export function maskEmail(email: string): string {
+  const [local, domain] = email.split("@");
+  if (!domain) return "***";
+  return `${local.slice(0, 2)}***@${domain}`;
+}
+
+/** Operator-facing explanation of an SMTP failure (logs + admin dashboard only). */
+export function describeSmtpError(err: unknown): string {
+  const e = err as {
+    code?: string;
+    responseCode?: number;
+    response?: string;
+    message?: string;
+  };
+  const code = e?.code ?? "";
+  const detail = String(e?.response ?? e?.message ?? err ?? "Unknown error")
+    .split("\n")[0]
+    .slice(0, 240);
+  let hint = "";
+  if (code === "EAUTH" || e?.responseCode === 535 || e?.responseCode === 534) {
+    hint =
+      " — the SMTP login was rejected. For Gmail, SMTP_USER must be the full Gmail address and SMTP_PASS a 16-character App Password (Google Account → Security → 2-Step Verification → App passwords).";
+  } else if (code === "ETIMEDOUT" || code === "ECONNECTION" || code === "ESOCKET" || code === "EDNS") {
+    hint = " — could not reach the SMTP server (host/port or network).";
+  } else if (code === "EENVELOPE") {
+    hint = " — the recipient or sender address was rejected.";
+  }
+  return `${code ? `${code}: ` : ""}${detail}${hint}`.slice(0, 500);
+}
+
+// ---------------------------------------------------------------------------
+// Delivery log (email_deliveries) — best effort, never blocks a send
+// ---------------------------------------------------------------------------
+
+interface DeliveryClaim {
+  id: string | null;
+  claimed: boolean;
+}
+
+async function claimDelivery(params: {
+  kind: EmailKind;
+  to: string;
+  subject: string;
+  dedupeKey?: string;
+  bookingId?: string | null;
+}): Promise<DeliveryClaim> {
+  const supabase = getSupabaseSecret();
+  const { data, error } = await supabase
+    .from("email_deliveries")
+    .insert({
+      kind: params.kind,
+      recipient: params.to,
+      subject: params.subject,
+      dedupe_key: params.dedupeKey ?? null,
+      booking_id: params.bookingId ?? null,
+      status: "sending",
+    })
+    .select("id")
+    .single();
+
+  if (!error && data) return { id: data.id as string, claimed: true };
+
+  if (error?.code === "23505" && params.dedupeKey) {
+    // Someone already sent (or is sending) this email. Retry only if that
+    // earlier attempt failed or crashed mid-send.
+    const { data: existing } = await supabase
+      .from("email_deliveries")
+      .select("id, status, attempts, updated_at")
+      .eq("dedupe_key", params.dedupeKey)
+      .maybeSingle();
+    if (!existing) return { id: null, claimed: false };
+
+    const stale =
+      existing.status === "sending" &&
+      Date.now() - new Date(existing.updated_at as string).getTime() > STALE_SENDING_MS;
+    if ((existing.status !== "failed" && !stale) || (existing.attempts as number) >= MAX_ATTEMPTS) {
+      return { id: existing.id as string, claimed: false };
+    }
+
+    // Optimistic lock on (status, attempts): only one concurrent retry wins.
+    const { data: reclaimed } = await supabase
+      .from("email_deliveries")
+      .update({
+        status: "sending",
+        error: null,
+        attempts: (existing.attempts as number) + 1,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", existing.id as string)
+      .eq("status", existing.status as string)
+      .eq("attempts", existing.attempts as number)
+      .select("id")
+      .maybeSingle();
+    return { id: existing.id as string, claimed: Boolean(reclaimed) };
+  }
+
+  // Log table unavailable (e.g. migration not applied yet): fail open.
+  logger.warn("[email] delivery log unavailable — sending without dedupe", {
+    kind: params.kind,
+    error: error?.message,
+  });
+  return { id: null, claimed: true };
+}
+
+async function finishDelivery(
+  id: string | null,
+  outcome: { status: "sent"; messageId: string | null } | { status: "failed"; error: string }
+): Promise<void> {
+  if (!id) return;
+  const supabase = getSupabaseSecret();
+  const { error } = await supabase
+    .from("email_deliveries")
+    .update({
+      status: outcome.status,
+      message_id: outcome.status === "sent" ? outcome.messageId : null,
+      error: outcome.status === "failed" ? outcome.error : null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", id);
+  if (error) {
+    logger.warn("[email] could not update delivery log", { id, error: error.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Core send
+// ---------------------------------------------------------------------------
+
+async function sendEmail(
+  opts: RenderedEmail & {
+    to: string;
+    kind: EmailKind;
+    /** Makes the send idempotent across webhook retries / concurrent callers. */
+    dedupeKey?: string;
+    bookingId?: string | null;
+  }
+): Promise<SendEmailResult> {
   const env = loadMailEnv();
-  if (!env.user || !env.pass) {
-    throw new ApiError(
-      500,
-      "Email not configured: SMTP_USER and SMTP_PASS are required",
-      "AUTH_CONFIG_ERROR"
+
+  if (env.dryRun) {
+    // Local development: no SMTP traffic and no delivery-log rows (so a dry
+    // run never consumes the dedupe key of a real email).
+    logger.info("[email] EMAIL_DRY_RUN — not sent", {
+      kind: opts.kind,
+      to: maskEmail(opts.to),
+      subject: opts.subject,
+    });
+    return { status: "dry_run" };
+  }
+
+  const claim = await claimDelivery({
+    kind: opts.kind,
+    to: opts.to,
+    subject: opts.subject,
+    dedupeKey: opts.dedupeKey,
+    bookingId: opts.bookingId,
+  });
+  if (!claim.claimed) {
+    logger.info("[email] already sent — skipping duplicate", {
+      kind: opts.kind,
+      dedupeKey: opts.dedupeKey,
+    });
+    return { status: "skipped", reason: "duplicate" };
+  }
+
+  const missing = missingMailEnv(env);
+  if (missing.length > 0) {
+    const reason = `Email not configured: set ${missing.join(" and ")} in the server environment`;
+    await finishDelivery(claim.id, { status: "failed", error: reason });
+    logger.error("[email] not configured", { kind: opts.kind, missing });
+    throw new EmailDeliveryError(
+      503,
+      "Email is temporarily unavailable. Please try again later.",
+      reason
+    );
+  }
+
+  try {
+    const info = await getTransporter(env).sendMail({
+      from: env.from,
+      to: opts.to,
+      replyTo: env.replyTo ?? undefined,
+      subject: opts.subject,
+      html: opts.html,
+      text: opts.text,
+    });
+    const messageId = (info.messageId as string | undefined) ?? null;
+    await finishDelivery(claim.id, { status: "sent", messageId });
+    logger.info("[email] sent", { kind: opts.kind, to: maskEmail(opts.to), messageId });
+    return { status: "sent", messageId };
+  } catch (err: unknown) {
+    const reason = describeSmtpError(err);
+    await finishDelivery(claim.id, { status: "failed", error: reason });
+    logger.error("[email] send failed", { kind: opts.kind, to: maskEmail(opts.to), error: reason });
+    throw new EmailDeliveryError(
+      502,
+      "We couldn't send the email right now. Please try again in a moment.",
+      reason
     );
   }
 }
 
-async function sendEmail(opts: { to: string; subject: string; html: string }): Promise<void> {
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+/** SMTP login check without sending anything. Cached per config for maxAgeMs. */
+export async function verifyEmailTransport(opts?: { maxAgeMs?: number }): Promise<SmtpVerifyResult> {
   const env = loadMailEnv();
-  const transport = getTransporter();
+  const missing = missingMailEnv(env);
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      configured: false,
+      missing,
+      error: `Missing: ${missing.join(", ")}`,
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  const key = transportKey(env);
+  const maxAgeMs = opts?.maxAgeMs ?? 0;
+  if (maxAgeMs > 0 && verifyCache?.key === key && Date.now() - verifyCache.at < maxAgeMs) {
+    return verifyCache.result;
+  }
+
+  const start = Date.now();
+  let result: SmtpVerifyResult;
   try {
-    await transport.sendMail({
-      from: env.from,
-      to: opts.to,
-      subject: opts.subject,
-      html: opts.html,
-    });
+    await getTransporter(env).verify();
+    result = { ok: true, configured: true, latencyMs: Date.now() - start, checkedAt: new Date().toISOString() };
   } catch (err: unknown) {
-    logger.error("sendEmail failed", {
-      to: opts.to,
-      error: err instanceof Error ? err.message : String(err),
-    });
+    result = {
+      ok: false,
+      configured: true,
+      latencyMs: Date.now() - start,
+      error: describeSmtpError(err),
+      checkedAt: new Date().toISOString(),
+    };
+  }
+  verifyCache = { key, at: Date.now(), result };
+  return result;
+}
+
+/** Non-secret view of the mail configuration for the admin dashboard. */
+export function getEmailConfigSummary() {
+  const env = loadMailEnv();
+  return {
+    transport: env.transport,
+    host: env.host ?? "smtp.gmail.com",
+    port: env.port ?? (env.host ? (env.secure ? 465 : 587) : 465),
+    secure: env.host ? env.secure : true,
+    user: env.user || null,
+    from: env.from || null,
+    replyTo: env.replyTo,
+    dryRun: env.dryRun,
+    missing: missingMailEnv(env),
+    sources: env.sources,
+  };
+}
+
+export async function listRecentEmailDeliveries(limit = 50) {
+  const supabase = getSupabaseSecret();
+  const { data, error } = await supabase
+    .from("email_deliveries")
+    .select("id, kind, recipient, subject, status, attempts, error, message_id, booking_id, created_at, updated_at")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (error) throw new ApiError(500, error.message, "DB_ERROR");
+  return data ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Public senders
+// ---------------------------------------------------------------------------
+
+/** Kept for callers that validate config up front. */
+export function validateEmailConfig(): void {
+  const missing = missingMailEnv();
+  if (missing.length > 0) {
     throw new ApiError(
-      500,
-      `Failed to send email: ${err instanceof Error ? err.message : String(err)}`,
+      503,
+      `Email not configured: ${missing.join(" and ")} required`,
       "EMAIL_FAILED"
     );
   }
 }
 
-export async function sendPasswordResetCode(
-  email: string,
-  code: string
-): Promise<void> {
-  return sendEmail({
-    to: email,
-    subject: "Your BookMyBarber Password Reset Code",
-    html: `
-      <!DOCTYPE html>
-      <html>
-        <head><meta charset="utf-8"></head>
-        <body style="font-family: Inter, Arial, sans-serif; background: #FBFAF9; padding: 32px;">
-          <div style="max-width: 480px; margin: 0 auto; background: #FFFFFF; border-radius: 16px; border: 1px solid #E5E0DC; padding: 32px;">
-            <h1 style="font-family: 'Playfair Display', serif; color: #E77423; font-size: 28px; margin: 0 0 8px;">BookMyBarber</h1>
-            <p style="color: #14181F; font-size: 15px; line-height: 1.5; margin: 0 0 20px;">
-              You requested a password reset. Use the code below to reset your password. This code expires in 15 minutes.
-            </p>
-            <div style="background: #F0EDEA; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 20px;">
-              <span style="font-family: 'Courier New', monospace; font-size: 36px; font-weight: 700; letter-spacing: 8px; color: #14181F;">
-                ${code}
-              </span>
-            </div>
-            <p style="color: #676F7E; font-size: 13px; line-height: 1.4; margin: 0;">
-              If you did not request this, you can safely ignore this email.
-            </p>
-          </div>
-        </body>
-      </html>
-    `,
-  });
+export async function sendPasswordResetCode(email: string, code: string): Promise<void> {
+  await sendEmail({ ...renderPasswordResetCodeEmail(code), to: email, kind: "password_reset" });
 }
 
 export async function sendAccountLockedEmail(email: string): Promise<void> {
+  await sendEmail({ ...renderAccountLockedEmail(), to: email, kind: "account_locked" });
+}
+
+export async function sendEmailVerificationCode(email: string, code: string): Promise<void> {
+  await sendEmail({ ...renderVerificationCodeEmail(code), to: email, kind: "verification_code" });
+}
+
+export async function sendBookingConfirmationEmail(
+  to: string,
+  ctx: BookingEmailContext
+): Promise<SendEmailResult> {
   return sendEmail({
-    to: email,
-    subject: "Your BookMyBarber account has been locked",
-    html: `
-      <!DOCTYPE html>
-      <html>
-        <head><meta charset="utf-8"></head>
-        <body style="font-family: Inter, Arial, sans-serif; background: #FBFAF9; padding: 32px;">
-          <div style="max-width: 480px; margin: 0 auto; background: #FFFFFF; border-radius: 16px; border: 1px solid #E5E0DC; padding: 32px;">
-            <h1 style="font-family: 'Playfair Display', serif; color: #E77423; font-size: 28px; margin: 0 0 8px;">Account Locked</h1>
-            <p style="color: #14181F; font-size: 15px; line-height: 1.5; margin: 0 0 20px;">
-              Your BookMyBarber account has been temporarily locked for 24 hours due to too many verification attempts.
-            </p>
-            <p style="color: #14181F; font-size: 15px; line-height: 1.5; margin: 0 0 20px;">
-              You will be able to try again after the lock period expires.
-            </p>
-            <p style="color: #676F7E; font-size: 13px; line-height: 1.4; margin: 0;">
-              If you did not make these attempts, please contact support.
-            </p>
-          </div>
-        </body>
-      </html>
-    `,
+    ...renderBookingConfirmationEmail(ctx),
+    to,
+    kind: "booking_confirmation",
+    dedupeKey: `booking_confirmation:${ctx.bookingId}`,
+    bookingId: ctx.bookingId,
   });
 }
 
-export async function sendEmailVerificationCode(
-  email: string,
-  code: string
-): Promise<void> {
+export async function sendPaymentReceiptEmail(
+  to: string,
+  ctx: BookingEmailContext,
+  payment: PaymentEmailInfo,
+  loyalty: LoyaltyEmailInfo | null
+): Promise<SendEmailResult> {
   return sendEmail({
-    to: email,
-    subject: "Verify your BookMyBarber email",
-    html: `
-      <!DOCTYPE html>
-      <html>
-        <head><meta charset="utf-8"></head>
-        <body style="font-family: Inter, Arial, sans-serif; background: #FBFAF9; padding: 32px;">
-          <div style="max-width: 480px; margin: 0 auto; background: #FFFFFF; border-radius: 16px; border: 1px solid #E5E0DC; padding: 32px;">
-            <h1 style="font-family: 'Playfair Display', serif; color: #E77423; font-size: 28px; margin: 0 0 8px;">Welcome to BookMyBarber</h1>
-            <p style="color: #14181F; font-size: 15px; line-height: 1.5; margin: 0 0 20px;">
-              Thanks for signing up! Use the code below to verify your email address. This code expires in 15 minutes.
-            </p>
-            <div style="background: #F0EDEA; border-radius: 12px; padding: 20px; text-align: center; margin-bottom: 20px;">
-              <span style="font-family: 'Courier New', monospace; font-size: 36px; font-weight: 700; letter-spacing: 8px; color: #14181F;">
-                ${code}
-              </span>
-            </div>
-            <p style="color: #676F7E; font-size: 13px; line-height: 1.4; margin: 0;">
-              If you did not sign up for BookMyBarber, you can safely ignore this email.
-            </p>
-          </div>
-        </body>
-      </html>
-    `,
+    ...renderPaymentReceiptEmail(ctx, payment, loyalty),
+    to,
+    kind: "payment_receipt",
+    dedupeKey: `payment_receipt:${ctx.bookingId}`,
+    bookingId: ctx.bookingId,
   });
+}
+
+export async function sendTestEmail(to: string): Promise<SendEmailResult> {
+  const sentAt = new Date().toLocaleString("en-GB", {
+    timeZone: "Asia/Karachi",
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+  return sendEmail({ ...renderTestEmail(`${sentAt} (PKT)`), to, kind: "test" });
 }

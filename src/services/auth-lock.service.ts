@@ -127,8 +127,14 @@ export async function lockAccount(email: string): Promise<void> {
         throw new ApiError(500, error.message, "DB_ERROR");
     }
 
-    const { sendAccountLockedEmail } = await import("./email.service");
-    await sendAccountLockedEmail(normalized);
+    // The notice is best-effort: an SMTP problem must not turn the lock
+    // response (403 ACCOUNT_LOCKED) into a 500 — the lock is already saved.
+    try {
+        const { sendAccountLockedEmail } = await import("./email.service");
+        await sendAccountLockedEmail(normalized);
+    } catch {
+        // failure is recorded in email_deliveries and the server log
+    }
 
     throw new ApiError(
         403,

@@ -28,6 +28,7 @@ import workerServicesRouter from "./worker-services";
 import workerAvailabilityRouter from "./worker-availability";
 import reviewsRouter, { shopReviewsRouter } from "./reviews";
 import analyticsRouter from "./analytics";
+import loyaltyRouter from "./loyalty";
 import { searchShopsQuerySchema, servicesSearchQuerySchema } from "../../../schemas/search";
 
 const router = Router();
@@ -74,6 +75,7 @@ router.use("/shops/:shopId/workers/:workerId/services", workerServicesRouter);
 router.use("/shops/:shopId/workers/:workerId/availability", workerAvailabilityRouter);
 router.use("/shops/:shopId/analytics", analyticsRouter);
 router.use("/shops/:shopId", shopReviewsRouter);
+router.use("/loyalty", loyaltyRouter);
 
 /**
  * ----------------------------------------------------

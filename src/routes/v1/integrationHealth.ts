@@ -1,6 +1,8 @@
 import { isCloudinaryConfigured, getCloudinary } from "../../config/cloudinary";
 import { isGeminiConfigured } from "../../services/gemini.service";
 import { checkPollinationsLive } from "../../services/pollinations.service";
+import { loadMailEnv } from "../../config/mailEnv";
+import { verifyEmailTransport } from "../../services/email.service";
 import { GoogleGenAI } from "@google/genai";
 
 type CheckStatus = "ok" | "degraded" | "error" | "skipped";
@@ -171,6 +173,37 @@ async function checkPollinations(): Promise<IntegrationCheck> {
   };
 }
 
+/** SMTP login probe (sends nothing). Cached so this public endpoint can't hammer the mail provider. */
+async function checkSmtp(): Promise<IntegrationCheck> {
+  const env = loadMailEnv();
+  if (env.dryRun) {
+    return {
+      status: "degraded",
+      configured: true,
+      message: "EMAIL_DRY_RUN=true — emails are logged, not sent",
+    };
+  }
+
+  const result = await verifyEmailTransport({ maxAgeMs: 5 * 60_000 });
+  if (!result.configured) {
+    return {
+      status: "error",
+      configured: false,
+      missing: result.missing,
+      message: `Missing: ${(result.missing ?? []).join(", ")} — verification codes, booking confirmations and receipts cannot be sent`,
+    };
+  }
+
+  return {
+    status: result.ok ? "ok" : "error",
+    configured: true,
+    latencyMs: result.latencyMs,
+    message: result.ok
+      ? `SMTP login OK (${env.host ?? "smtp.gmail.com"})`
+      : `SMTP login failed: ${result.error}`,
+  };
+}
+
 function checkCloudinaryFlag(): IntegrationCheck {
   const ok = isCloudinaryConfigured();
   return {
@@ -185,10 +218,11 @@ export async function runIntegrationHealthChecks(): Promise<{
   timestamp: string;
   integrations: Record<string, IntegrationCheck>;
 }> {
-  const [gemini, cloudinary, pollinations, geminiFlag, cloudinaryFlag] = await Promise.all([
+  const [gemini, cloudinary, pollinations, smtp, geminiFlag, cloudinaryFlag] = await Promise.all([
     checkGeminiLive(),
     checkCloudinaryLive(),
     checkPollinations(),
+    checkSmtp(),
     Promise.resolve(checkGeminiAnalysis()),
     Promise.resolve(checkCloudinaryFlag()),
   ]);
@@ -201,6 +235,7 @@ export async function runIntegrationHealthChecks(): Promise<{
     gemini,
     cloudinary,
     pollinations,
+    smtp,
     supabaseJwt,
     cron,
     apiBaseUrl,

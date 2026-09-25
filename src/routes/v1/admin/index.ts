@@ -4,11 +4,18 @@ import { asyncHandler } from "../../../middleware/asyncHandler";
 import { getSupabaseSecret } from "../../../config/supabase";
 import { ApiError } from "../../../lib/errors";
 import { adminBookingsQuerySchema } from "../../../schemas/booking";
+import barbersRouter from "./barbers";
+import loyaltyRouter from "./loyalty";
+import emailRouter from "./email";
 
 const router = Router();
 
 /** All /v1/admin/* routes require admin role */
 router.use(authenticate, authorize("admin"));
+
+router.use("/barbers", barbersRouter);
+router.use("/loyalty", loyaltyRouter);
+router.use("/email", emailRouter);
 
 /** GET /v1/admin/dashboard/stats */
 router.get(

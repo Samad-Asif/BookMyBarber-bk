@@ -16,6 +16,11 @@ import { expireUnpaidBookings } from "./booking-expiry.service";
 import type { BatchBookingItem } from "../schemas/booking";
 import { createCalendarEventForBooking } from "./calendar/calendar.service";
 import { sendWelcomeOnApproval } from "./chat.service";
+import { syncCustomerLoyalty } from "./loyalty.service";
+import {
+  scheduleBookingConfirmation,
+  schedulePaymentNotifications,
+} from "./booking-notifications.service";
 
 async function assertWorkerBelongsToShop(
   shopId: string,
@@ -538,14 +543,38 @@ export async function approveBooking(params: {
     // welcome message is best-effort; approval already succeeded
   }
 
+  scheduleBookingConfirmation(params.bookingId);
+
   return updated;
 }
 
+/**
+ * Record a booking's payment status (SafePay webhook or app polling), then:
+ * re-tier the customer's loyalty status from their spend, and — for payments —
+ * send the receipt (plus the confirmation when the shop auto-approves).
+ * Safe to call repeatedly for the same payment: loyalty is recomputed from
+ * source and each email is deduplicated per booking.
+ */
 export async function updateBookingPaymentStatus(
   bookingId: string,
   paymentStatus: "paid" | "refunded",
   paymentTracker?: string
 ) {
+  const customerId = await applyBookingPaymentStatus(bookingId, paymentStatus, paymentTracker);
+
+  await syncCustomerLoyalty(customerId);
+
+  if (paymentStatus === "paid") {
+    schedulePaymentNotifications(bookingId);
+  }
+}
+
+/** Persists the payment status (auto-approving when the shop allows it). Returns the customer id. */
+async function applyBookingPaymentStatus(
+  bookingId: string,
+  paymentStatus: "paid" | "refunded",
+  paymentTracker?: string
+): Promise<string> {
   const supabase = getSupabaseSecret();
 
   const { data: booking } = await supabase
@@ -557,6 +586,8 @@ export async function updateBookingPaymentStatus(
   if (!booking) {
     throw new ApiError(404, "Booking not found", "NOT_FOUND");
   }
+
+  const customerId = booking.customer_id as string;
 
   if (
     paymentStatus === "paid" &&
@@ -585,7 +616,7 @@ export async function updateBookingPaymentStatus(
     .eq("id", bookingId);
 
   if (paymentStatus !== "paid" || booking.status !== "pending") {
-    return;
+    return customerId;
   }
 
   const { data: shop } = await supabase
@@ -595,7 +626,7 @@ export async function updateBookingPaymentStatus(
     .maybeSingle();
 
   if (!shop?.auto_approve) {
-    return;
+    return customerId;
   }
 
   // Auto-approve is final confirmation once paid
@@ -634,11 +665,11 @@ export async function updateBookingPaymentStatus(
     .maybeSingle();
 
   if (error || !updated) {
-    return;
+    return customerId;
   }
 
   const ownerId = shop.owner_id as string | null;
-  if (!ownerId) return;
+  if (!ownerId) return customerId;
 
   try {
     const eventIds = await createCalendarEventForBooking(ownerId, updated);
@@ -668,6 +699,8 @@ export async function updateBookingPaymentStatus(
       // best-effort
     }
   }
+
+  return customerId;
 }
 
 type BookingItemAttachRow = {
