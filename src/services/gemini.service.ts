@@ -783,15 +783,23 @@ export interface AnalysisResult {
 export async function runHaircutPipeline(
     photoUrls: [string, string, string],
     customerPrompt?: string,
-): Promise<{ analysis: AnalysisResult; imageBuffer: Buffer | null }> {
+): Promise<{ analysis: AnalysisResult; imageBuffer: Buffer | null; imageError: string | null }> {
     if (!isGeminiConfigured()) {
         throw new ApiError(503, "Gemini AI is not configured", "NOT_CONFIGURED");
     }
 
     const analysis = await runTextAnalysisOnly(photoUrls, customerPrompt);
     const generationPrompt = analysis.generation_prompt || analysis.suggested_haircut;
-    const imageBuffer = await generateHaircutViaPollinations(photoUrls, generationPrompt);
-    return { analysis, imageBuffer };
+    // The styled preview is optional: if the image service fails, still return
+    // the (already paid-for) Gemini analysis instead of failing the whole job.
+    try {
+        const imageBuffer = await generateHaircutViaPollinations(photoUrls, generationPrompt);
+        return { analysis, imageBuffer, imageError: null };
+    } catch (err: unknown) {
+        const imageError = err instanceof Error ? err.message : String(err);
+        console.warn("[gemini] preview image unavailable — returning analysis only:", imageError);
+        return { analysis, imageBuffer: null, imageError };
+    }
 }
 
 /** @deprecated Use runHaircutPipeline — kept for backwards compatibility */

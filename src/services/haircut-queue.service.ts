@@ -321,7 +321,7 @@ async function processJob(
     await supabase.from("haircut_requests").update({ status: "analyzing" }).eq("id", id);
     logger.info("[haircut-queue] analyzing", { id });
 
-    const { analysis, imageBuffer } = await runHaircutPipeline(imageUrls);
+    const { analysis, imageBuffer, imageError } = await runHaircutPipeline(imageUrls);
 
     await supabase.from("haircut_requests").update({
         face_shape: analysis.face_shape,
@@ -347,15 +347,28 @@ async function processJob(
     logger.info("[haircut-queue] generating image", { id });
 
     let imgBuf = imageBuffer;
-    if (!imgBuf) {
+    if (!imgBuf && !imageError) {
         logger.warn("[haircut-queue] no image from pipeline — retrying image-only", { id });
-        imgBuf = await generateHaircutImageForQueue(imageUrls, analysis.generation_prompt || analysis.suggested_haircut);
+        imgBuf = await generateHaircutImageForQueue(imageUrls, analysis.generation_prompt || analysis.suggested_haircut)
+            .catch(() => null);
     }
 
     if (!imgBuf) {
-        const err = new Error("Could not generate your styled haircut image. Please try again.");
-        (err as { stage?: string }).stage = "generation";
-        throw err;
+        // Deliver the analysis without a preview rather than failing the job
+        // (the app shows "Analysis complete" when there is no image).
+        logger.warn("[haircut-queue] completed without preview image", { id, imageError });
+        await supabase
+            .from("haircut_requests")
+            .update({
+                status: "completed",
+                error_stage: "generation",
+                error_message: imageError ?? "Styled preview image could not be generated.",
+            })
+            .eq("id", id);
+        if (job.ai_analysis_id) {
+            await supabase.from("ai_analyses").update({ status: "completed" }).eq("id", job.ai_analysis_id);
+        }
+        return;
     }
 
     const uploaded = await uploadImage(imgBuf, "image/jpeg", "haircut-generations");

@@ -65,6 +65,15 @@ async function tryGenerateWithModel(
     if (!res.ok) {
         const body = await res.text().catch(() => "");
         console.error("[pollinations] HTTP error", { model, status: res.status, body: body.slice(0, 300) });
+        // Pollinations no longer serves free anonymous images: it answers
+        // 402 / "Insufficient balance" (wrapped in a 500) for every model.
+        if (res.status === 402 || /insufficient balance|\b402\b/i.test(body)) {
+            throw new ApiError(
+                503,
+                "Styled preview images are unavailable right now (image service credits exhausted).",
+                "IMAGE_GEN_UNAVAILABLE",
+            );
+        }
         throw new ApiError(
             502,
             res.status === 429
@@ -112,6 +121,8 @@ export async function generateHaircutImageForQueue(
             return await tryGenerateWithModel(prompt, referenceUrl, model);
         } catch (err: unknown) {
             lastErr = err;
+            // Out of credits applies to every model — don't spend another ~45s.
+            if (err instanceof ApiError && err.code === "IMAGE_GEN_UNAVAILABLE") throw err;
             const msg = err instanceof Error ? err.message : String(err);
             if (msg.includes("abort") || msg.includes("timeout")) {
                 throw new ApiError(504, "Image generation timed out. Please try again.", "IMAGE_GEN_TIMEOUT");
