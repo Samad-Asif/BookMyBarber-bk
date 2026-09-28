@@ -6,7 +6,7 @@ import { logger } from "../config/logger";
  * Spend-based loyalty tiers. Lifetime spend = paid SafePay payments (minus
  * refunded bookings), recomputed in Postgres by recalc_customer_loyalty().
  */
-export const LOYALTY_TIER_KEYS = ["iron", "silver", "gold", "diamond", "platinum"] as const;
+export const LOYALTY_TIER_KEYS = ["iron", "silver", "gold", "platinum", "diamond"] as const;
 export type LoyaltyTierKey = (typeof LOYALTY_TIER_KEYS)[number];
 
 export interface LoyaltyTier {
@@ -173,16 +173,16 @@ export async function getCustomerLoyalty(customerId: string): Promise<LoyaltySum
   );
 }
 
-/** Update Silver→Platinum thresholds (Iron is always 0), then re-tier everyone. */
+/** Update Silver→Diamond thresholds (Iron is always 0), then re-tier everyone. */
 export async function updateLoyaltyThresholds(
   thresholds: LoyaltyThresholds
 ): Promise<{ tiers: LoyaltyTier[]; customersUpdated: number }> {
-  const ordered = [thresholds.silver, thresholds.gold, thresholds.diamond, thresholds.platinum];
+  const ordered = [thresholds.silver, thresholds.gold, thresholds.platinum, thresholds.diamond];
   const increasing = ordered.every((value, i) => i === 0 || value > ordered[i - 1]);
   if (!increasing || thresholds.silver <= 0) {
     throw new ApiError(
       400,
-      "Thresholds must increase: 0 < Silver < Gold < Diamond < Platinum",
+      "Thresholds must increase: 0 < Silver < Gold < Platinum < Diamond",
       "VALIDATION_ERROR"
     );
   }

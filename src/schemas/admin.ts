@@ -14,13 +14,13 @@ export const loyaltyThresholdsBodySchema = z
     thresholds: z.object({
       silver: thresholdPkr,
       gold: thresholdPkr,
-      diamond: thresholdPkr,
       platinum: thresholdPkr,
+      diamond: thresholdPkr,
     }),
   })
   .refine(
-    ({ thresholds: t }) => t.silver < t.gold && t.gold < t.diamond && t.diamond < t.platinum,
-    { message: "Thresholds must increase: Silver < Gold < Diamond < Platinum" }
+    ({ thresholds: t }) => t.silver < t.gold && t.gold < t.platinum && t.platinum < t.diamond,
+    { message: "Thresholds must increase: Silver < Gold < Platinum < Diamond" }
   );
 
 export type LoyaltyThresholdsBody = z.infer<typeof loyaltyThresholdsBodySchema>;

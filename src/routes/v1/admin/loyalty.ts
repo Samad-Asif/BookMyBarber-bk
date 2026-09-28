@@ -33,7 +33,7 @@ router.get(
   })
 );
 
-/** PUT /v1/admin/loyalty/tiers — change Silver→Platinum thresholds, re-tier everyone */
+/** PUT /v1/admin/loyalty/tiers — change Silver→Diamond thresholds, re-tier everyone */
 router.put(
   "/tiers",
   asyncHandler(async (req: Request, res: Response) => {
