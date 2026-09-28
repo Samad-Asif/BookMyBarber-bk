@@ -23,68 +23,29 @@ export function computeCommission(pricePkr: number): number {
   return Math.round(pricePkr * COMMISSION_RATE);
 }
 
+type Range = { start: number; end: number };
+
+/** A booked time window held by one barber, or by the whole shop when workerId is null. */
+type Hold = Range & { workerId: string | null };
+
 /**
- * Build conflict ranges for a shop/date, using booking_items when present
- * (per-worker windows) and parent booking rows for single-service bookings.
+ * Everything needed to answer "is this barber free?" for one shop and date,
+ * loaded once per request. Every barber keeps an independent calendar: a
+ * booking only blocks the barber it is assigned to, while bookings without a
+ * barber and the owner's own calendar events block the whole shop.
  */
-async function loadBlockingBookingRanges(
-  shopId: string,
-  date: string,
-  workerId: string | null | undefined,
-  excludeBookingId?: string
-): Promise<{ start: number; end: number }[]> {
-  const supabase = getSupabaseSecret();
-
-  let bookingsQuery = supabase
-    .from("bookings")
-    .select("id, start_time, end_time, worker_id")
-    .eq("shop_id", shopId)
-    .eq("booking_date", date)
-    .in("status", [...BLOCKING_STATUSES]);
-
-  if (excludeBookingId) {
-    bookingsQuery = bookingsQuery.neq("id", excludeBookingId);
-  }
-
-  const { data: existingBookings } = await bookingsQuery;
-  if (!existingBookings?.length) return [];
-
-  const bookingIds = existingBookings.map((b) => b.id as string);
-  const { data: items } = await supabase
-    .from("booking_items")
-    .select("booking_id, worker_id, start_time, end_time")
-    .in("booking_id", bookingIds);
-
-  const bookingsWithItems = new Set(
-    (items ?? []).map((i) => i.booking_id as string)
-  );
-  const ranges: { start: number; end: number }[] = [];
-
-  for (const item of items ?? []) {
-    const itemWorker = item.worker_id as string | null;
-    if (workerId) {
-      // Named worker: item for this worker, or shop-wide (null) hold
-      if (itemWorker != null && itemWorker !== workerId) continue;
-    }
-    ranges.push({
-      start: parseTimeToMinutes(item.start_time as string),
-      end: parseTimeToMinutes(item.end_time as string),
-    });
-  }
-
-  for (const b of existingBookings) {
-    if (bookingsWithItems.has(b.id as string)) continue;
-    const bWorker = b.worker_id as string | null;
-    if (workerId) {
-      if (bWorker != null && bWorker !== workerId) continue;
-    }
-    ranges.push({
-      start: parseTimeToMinutes(b.start_time as string),
-      end: parseTimeToMinutes(b.end_time as string),
-    });
-  }
-
-  return ranges;
+interface ShopDayContext {
+  timezone: string;
+  /** Shop working hours for the day; null when the shop is closed. */
+  shopHours: Range | null;
+  /**
+   * Barbers with their own weekly schedule (worker_availability): their hours
+   * for the day, or null when the day is switched off. Barbers without a
+   * schedule work the shop's hours; nobody is bookable while the shop is closed.
+   */
+  workerHours: Map<string, Range | null>;
+  holds: Hold[];
+  busyRanges: Range[];
 }
 
 export interface SlotResult {
@@ -102,16 +63,6 @@ export interface SlotBookableParams {
   excludeBookingId?: string;
   requireApproved?: boolean;
   checkPast?: boolean;
-}
-
-interface ShopSlotContext {
-  shopId: string;
-  ownerId: string | null;
-  timezone: string;
-  openMin: number;
-  closeMin: number;
-  bookingRanges: { start: number; end: number }[];
-  busyRanges: { start: number; end: number }[];
 }
 
 function validateDateString(date: string): void {
@@ -161,12 +112,169 @@ function assertNotPastSlot(
   }
 }
 
-async function loadShopSlotContext(
+function isPastSlot(date: string, startMin: number, timezone: string): boolean {
+  try {
+    assertNotPastSlot(date, startMin, timezone);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function toRange(row: { start_time: unknown; end_time: unknown }): Range {
+  return {
+    start: parseTimeToMinutes(row.start_time as string),
+    end: parseTimeToMinutes(row.end_time as string),
+  };
+}
+
+async function loadShopHours(shopId: string, dayOfWeek: number): Promise<Range | null> {
+  const { data, error } = await getSupabaseSecret()
+    .from("working_hours")
+    .select("start_time, end_time")
+    .eq("shop_id", shopId)
+    .eq("day_of_week", dayOfWeek)
+    .eq("is_active", true);
+
+  if (error) throw new ApiError(500, error.message, "DB_ERROR");
+  return data?.length ? toRange(data[0]) : null;
+}
+
+async function loadWorkerHours(
+  workerIds: string[],
+  dayOfWeek: number
+): Promise<Map<string, Range | null>> {
+  const hours = new Map<string, Range | null>();
+  if (workerIds.length === 0) return hours;
+
+  const { data, error } = await getSupabaseSecret()
+    .from("worker_availability")
+    .select("worker_id, start_time, end_time, is_active")
+    .in("worker_id", workerIds)
+    .eq("day_of_week", dayOfWeek);
+
+  if (error) throw new ApiError(500, error.message, "DB_ERROR");
+  for (const row of data ?? []) {
+    hours.set(row.worker_id as string, row.is_active ? toRange(row) : null);
+  }
+  return hours;
+}
+
+/** Time held by pending/approved bookings on the date, per barber. */
+async function loadHolds(
   shopId: string,
   date: string,
-  workerId: string | null | undefined,
   excludeBookingId?: string
-): Promise<ShopSlotContext> {
+): Promise<Hold[]> {
+  const supabase = getSupabaseSecret();
+
+  let bookingsQuery = supabase
+    .from("bookings")
+    .select("id, start_time, end_time, worker_id")
+    .eq("shop_id", shopId)
+    .eq("booking_date", date)
+    .in("status", [...BLOCKING_STATUSES]);
+
+  if (excludeBookingId) {
+    bookingsQuery = bookingsQuery.neq("id", excludeBookingId);
+  }
+
+  const { data: bookings, error } = await bookingsQuery;
+  if (error) throw new ApiError(500, error.message, "DB_ERROR");
+  if (!bookings?.length) return [];
+
+  const { data: items, error: itemsErr } = await supabase
+    .from("booking_items")
+    .select("booking_id, worker_id, start_time, end_time")
+    .in("booking_id", bookings.map((b) => b.id as string));
+
+  if (itemsErr) throw new ApiError(500, itemsErr.message, "DB_ERROR");
+
+  // Multi-service bookings hold each item's barber for that item only;
+  // single-service bookings hold their barber for the whole booking.
+  const bookingsWithItems = new Set((items ?? []).map((i) => i.booking_id as string));
+  const rows = [
+    ...(items ?? []),
+    ...bookings.filter((b) => !bookingsWithItems.has(b.id as string)),
+  ];
+
+  return rows.map((row) => ({
+    workerId: (row.worker_id as string | null) ?? null,
+    ...toRange(row),
+  }));
+}
+
+/**
+ * The owner's external calendar events for the day. Events this app wrote to
+ * that calendar for approved bookings are skipped: those bookings already hold
+ * their own barber, and counting them again would block the whole shop.
+ */
+async function loadOwnerBusyRanges(
+  ownerId: string,
+  date: string,
+  timezone: string
+): Promise<Range[]> {
+  const supabase = getSupabaseSecret();
+  const dayStart = utcInstantForLocalMidnight(date, timezone);
+  const dayEnd = utcInstantForLocalMidnight(nextDateString(date), timezone);
+
+  const { data: blocks, error } = await supabase
+    .from("calendar_busy_blocks")
+    .select("provider, external_event_id, start_at, end_at")
+    .eq("user_id", ownerId)
+    .lt("start_at", dayEnd.toISOString())
+    .gt("end_at", dayStart.toISOString());
+
+  if (error) throw new ApiError(500, error.message, "DB_ERROR");
+  if (!blocks?.length) return [];
+
+  const bookingEvents = new Set<string>();
+  const googleIds = blocks
+    .filter((b) => b.provider === "google")
+    .map((b) => b.external_event_id as string);
+  const microsoftIds = blocks
+    .filter((b) => b.provider === "microsoft")
+    .map((b) => b.external_event_id as string);
+
+  if (googleIds.length > 0) {
+    const { data, error: gErr } = await supabase
+      .from("bookings")
+      .select("calendar_event_id_google")
+      .in("calendar_event_id_google", googleIds);
+    if (gErr) throw new ApiError(500, gErr.message, "DB_ERROR");
+    for (const row of data ?? []) bookingEvents.add(`google:${row.calendar_event_id_google}`);
+  }
+  if (microsoftIds.length > 0) {
+    const { data, error: mErr } = await supabase
+      .from("bookings")
+      .select("calendar_event_id_microsoft")
+      .in("calendar_event_id_microsoft", microsoftIds);
+    if (mErr) throw new ApiError(500, mErr.message, "DB_ERROR");
+    for (const row of data ?? []) bookingEvents.add(`microsoft:${row.calendar_event_id_microsoft}`);
+  }
+
+  const busyRanges: Range[] = [];
+  for (const block of blocks) {
+    if (bookingEvents.has(`${block.provider}:${block.external_event_id}`)) continue;
+
+    const blockStart = new Date(block.start_at as string);
+    const blockEnd = new Date(block.end_at as string);
+    const startDate = dateStringInTimezone(blockStart, timezone);
+    const endDate = dateStringInTimezone(blockEnd, timezone);
+
+    // Clip to this day; an event running through the whole day blocks all of it.
+    const s = startDate === date ? minutesOfDayInTimezone(blockStart, timezone) : 0;
+    const e = endDate === date ? minutesOfDayInTimezone(blockEnd, timezone) : 24 * 60;
+    if (s < e) busyRanges.push({ start: s, end: e });
+  }
+  return busyRanges;
+}
+
+async function loadShopDayContext(
+  shopId: string,
+  date: string,
+  options: { workerIds?: string[]; excludeBookingId?: string } = {}
+): Promise<ShopDayContext> {
   // Free slots held by abandoned unpaid bookings before computing availability
   const { expireUnpaidBookings } = await import("./booking-expiry.service");
   await expireUnpaidBookings({ shopId });
@@ -184,154 +292,148 @@ async function loadShopSlotContext(
   }
 
   const timezone = SHOP_TIMEZONE;
-
   const dayOfWeek = dayOfWeekInTimezone(date, timezone);
+  const ownerId = (shop.owner_id as string | null) ?? null;
 
-  // If a worker is specified, check per-worker availability first
-  if (workerId) {
-    const { data: wa } = await supabase
-      .from("worker_availability")
-      .select("start_time, end_time")
-      .eq("worker_id", workerId)
-      .eq("day_of_week", dayOfWeek)
-      .eq("is_active", true);
+  const [shopHours, workerHours, holds, busyRanges] = await Promise.all([
+    loadShopHours(shopId, dayOfWeek),
+    loadWorkerHours([...new Set(options.workerIds ?? [])], dayOfWeek),
+    loadHolds(shopId, date, options.excludeBookingId),
+    ownerId ? loadOwnerBusyRanges(ownerId, date, timezone) : Promise.resolve([]),
+  ]);
 
-    if (wa && wa.length > 0) {
-      // Worker has custom availability — use it instead of shop hours
-      const waRow = wa[0];
-      const openMin = parseTimeToMinutes(waRow.start_time as string);
-      const closeMin = parseTimeToMinutes(waRow.end_time as string);
-
-      const bookingRanges = await loadBlockingBookingRanges(
-        shopId,
-        date,
-        workerId,
-        excludeBookingId
-      );
-
-      // busy blocks (owner calendar)
-      const supabase2 = getSupabaseSecret();
-      let busyRanges: { start: number; end: number }[] = [];
-      if (shop.owner_id) {
-        const dayStart = utcInstantForLocalMidnight(date, timezone);
-        const dayEnd = utcInstantForLocalMidnight(nextDateString(date), timezone);
-        const { data: busyBlocks } = await supabase2
-          .from("calendar_busy_blocks")
-          .select("start_at, end_at")
-          .eq("user_id", shop.owner_id as string)
-          .lt("start_at", dayEnd.toISOString())
-          .gt("end_at", dayStart.toISOString());
-
-        for (const block of busyBlocks ?? []) {
-          const blockStart = new Date(block.start_at as string);
-          const blockEnd = new Date(block.end_at as string);
-          const startDate = dateStringInTimezone(blockStart, timezone);
-          const endDate = dateStringInTimezone(blockEnd, timezone);
-          if (startDate !== date && endDate !== date) {
-            const s = Math.max(0, minutesOfDayInTimezone(blockStart, timezone));
-            const e = Math.min(24 * 60, minutesOfDayInTimezone(blockEnd, timezone));
-            if (s < e) busyRanges.push({ start: s, end: e });
-          } else {
-            const s = startDate === date ? minutesOfDayInTimezone(blockStart, timezone) : 0;
-            const e = endDate === date ? minutesOfDayInTimezone(blockEnd, timezone) : 24 * 60;
-            if (s < e) busyRanges.push({ start: s, end: e });
-          }
-        }
-      }
-
-      return {
-        shopId,
-        ownerId: shop.owner_id as string | null,
-        timezone,
-        openMin,
-        closeMin,
-        bookingRanges,
-        busyRanges,
-      };
-    }
-    // No worker_availability rows → fall back to shop working_hours (below)
-  }
-
-  const { data: hours } = await supabase
-    .from("working_hours")
-    .select("start_time, end_time")
-    .eq("shop_id", shopId)
-    .eq("day_of_week", dayOfWeek)
-    .eq("is_active", true);
-
-  if (!hours?.length) {
-    throw new ApiError(400, "Shop is closed on this day", "SHOP_CLOSED");
-  }
-
-  const wh = hours[0];
-  const openMin = parseTimeToMinutes(wh.start_time as string);
-  const closeMin = parseTimeToMinutes(wh.end_time as string);
-
-  const bookingRanges = await loadBlockingBookingRanges(
-    shopId,
-    date,
-    workerId ?? null,
-    excludeBookingId
-  );
-
-  const ownerId = shop.owner_id as string | null;
-  const userIds = ownerId ? [ownerId] : [];
-
-  let busyRanges: { start: number; end: number }[] = [];
-
-  if (userIds.length > 0) {
-    const supabase3 = getSupabaseSecret();
-    const dayStart = utcInstantForLocalMidnight(date, timezone);
-    const dayEnd = utcInstantForLocalMidnight(nextDateString(date), timezone);
-
-    const { data: busyBlocks } = await supabase3
-      .from("calendar_busy_blocks")
-      .select("start_at, end_at")
-      .in("user_id", userIds)
-      .lt("start_at", dayEnd.toISOString())
-      .gt("end_at", dayStart.toISOString());
-
-    for (const block of busyBlocks ?? []) {
-      const blockStart = new Date(block.start_at as string);
-      const blockEnd = new Date(block.end_at as string);
-      const startDate = dateStringInTimezone(blockStart, timezone);
-      const endDate = dateStringInTimezone(blockEnd, timezone);
-
-      if (startDate !== date && endDate !== date) {
-        const s = Math.max(0, minutesOfDayInTimezone(blockStart, timezone));
-        const e = Math.min(24 * 60, minutesOfDayInTimezone(blockEnd, timezone));
-        if (s < e) busyRanges.push({ start: s, end: e });
-      } else {
-        const s = startDate === date ? minutesOfDayInTimezone(blockStart, timezone) : 0;
-        const e = endDate === date ? minutesOfDayInTimezone(blockEnd, timezone) : 24 * 60;
-        if (s < e) busyRanges.push({ start: s, end: e });
-      }
-    }
-  }
-
-  return {
-    shopId,
-    ownerId,
-    timezone,
-    openMin,
-    closeMin,
-    bookingRanges,
-    busyRanges,
-  };
+  return { timezone, shopHours, workerHours, holds, busyRanges };
 }
 
-function slotHasConflict(
-  startMin: number,
-  endMin: number,
-  ctx: ShopSlotContext
+/**
+ * When the barber can be booked on the day: the shop's hours, narrowed to the
+ * barber's own schedule when they have one. Null when the shop is closed or the
+ * barber is off.
+ */
+function hoursFor(ctx: ShopDayContext, workerId: string | null): Range | null {
+  const shop = ctx.shopHours;
+  if (!shop || !workerId || !ctx.workerHours.has(workerId)) return shop;
+
+  const own = ctx.workerHours.get(workerId);
+  if (!own) return null;
+  const start = Math.max(shop.start, own.start);
+  const end = Math.min(shop.end, own.end);
+  return start < end ? { start, end } : null;
+}
+
+function withinHours(hours: Range | null, start: number, end: number): boolean {
+  return hours != null && start >= hours.start && end <= hours.end;
+}
+
+/**
+ * A barber is blocked by their own bookings and by shop-wide holds; with no
+ * barber (a shop that has none for the service) every booking blocks.
+ */
+function blocks(hold: Hold, workerId: string | null): boolean {
+  return workerId == null || hold.workerId == null || hold.workerId === workerId;
+}
+
+function hasConflict(
+  ctx: ShopDayContext,
+  workerId: string | null,
+  start: number,
+  end: number,
+  extraHolds: Hold[] = []
 ): boolean {
-  const conflictsBooking = ctx.bookingRanges.some((r) =>
-    rangesOverlap(startMin, endMin, r.start, r.end)
+  const clashes = (h: Hold) => blocks(h, workerId) && rangesOverlap(start, end, h.start, h.end);
+  return (
+    ctx.holds.some(clashes) ||
+    extraHolds.some(clashes) ||
+    ctx.busyRanges.some((r) => rangesOverlap(start, end, r.start, r.end))
   );
-  const conflictsBusy = ctx.busyRanges.some((r) =>
-    rangesOverlap(startMin, endMin, r.start, r.end)
+}
+
+function isWorkerFree(
+  ctx: ShopDayContext,
+  workerId: string | null,
+  start: number,
+  end: number,
+  extraHolds: Hold[] = []
+): boolean {
+  return (
+    withinHours(hoursFor(ctx, workerId), start, end) &&
+    !hasConflict(ctx, workerId, start, end, extraHolds)
   );
-  return conflictsBooking || conflictsBusy;
+}
+
+/**
+ * Pick a barber from `candidates` who is working and free for [start, end).
+ * Keeps `preferred` (the barber of the customer's previous service) when free,
+ * otherwise takes the least-booked barber; ties go by id so results are stable.
+ */
+function pickFreeWorker(
+  ctx: ShopDayContext,
+  candidates: string[],
+  start: number,
+  end: number,
+  extraHolds: Hold[] = [],
+  preferred?: string | null
+): string | null {
+  if (preferred && candidates.includes(preferred) && isWorkerFree(ctx, preferred, start, end, extraHolds)) {
+    return preferred;
+  }
+
+  const bookedMinutes = (workerId: string) =>
+    [...ctx.holds, ...extraHolds]
+      .filter((h) => h.workerId === workerId)
+      .reduce((sum, h) => sum + (h.end - h.start), 0);
+
+  let best: string | null = null;
+  let bestLoad = Infinity;
+  for (const workerId of [...candidates].sort()) {
+    if (!isWorkerFree(ctx, workerId, start, end, extraHolds)) continue;
+    const load = bookedMinutes(workerId);
+    if (load < bestLoad) {
+      best = workerId;
+      bestLoad = load;
+    }
+  }
+  return best;
+}
+
+/** Slot start times on each candidate's own 15-minute grid, merged and sorted. */
+function candidateStarts(
+  ctx: ShopDayContext,
+  workerIds: (string | null)[],
+  durationMinutes: number
+): number[] {
+  const starts = new Set<number>();
+  for (const workerId of workerIds) {
+    const hours = hoursFor(ctx, workerId);
+    if (!hours) continue;
+    for (let start = hours.start; start + durationMinutes <= hours.end; start += SLOT_STEP_MINUTES) {
+      starts.add(start);
+    }
+  }
+  return [...starts].sort((a, b) => a - b);
+}
+
+/** Active barbers of the shop who are assigned this service. */
+async function eligibleWorkerIds(shopId: string, serviceId: string): Promise<string[]> {
+  const supabase = getSupabaseSecret();
+  const { data: links, error } = await supabase
+    .from("worker_services")
+    .select("worker_id")
+    .eq("service_id", serviceId);
+
+  if (error) throw new ApiError(500, error.message, "DB_ERROR");
+  const ids = (links ?? []).map((l) => l.worker_id as string);
+  if (ids.length === 0) return [];
+
+  const { data: workers, error: workersErr } = await supabase
+    .from("workers")
+    .select("id")
+    .eq("shop_id", shopId)
+    .eq("is_active", true)
+    .in("id", ids);
+
+  if (workersErr) throw new ApiError(500, workersErr.message, "DB_ERROR");
+  return (workers ?? []).map((w) => w.id as string);
 }
 
 /** Throws ApiError when slot cannot be booked (single source of truth for slots API + create/approve). */
@@ -348,7 +450,7 @@ export async function assertSlotBookable(params: SlotBookableParams): Promise<vo
   const supabase = getSupabaseSecret();
   const { data: shop, error: shopErr } = await supabase
     .from("barber_shops")
-    .select("status, owner_id")
+    .select("status")
     .eq("id", params.shopId)
     .single();
 
@@ -370,16 +472,23 @@ export async function assertSlotBookable(params: SlotBookableParams): Promise<vo
     assertNotPastSlot(params.date, startMin, timezone);
   }
 
-  const ctx = await loadShopSlotContext(
-    params.shopId,
-    params.date,
-    params.workerId ?? null,
-    params.excludeBookingId
-  );
+  const workerId = params.workerId ?? null;
+  const ctx = await loadShopDayContext(params.shopId, params.date, {
+    workerIds: workerId ? [workerId] : [],
+    excludeBookingId: params.excludeBookingId,
+  });
 
-  assertWithinWorkingHours(startMin, endMin, ctx.openMin, ctx.closeMin);
+  const hours = hoursFor(ctx, workerId);
+  if (!hours) {
+    if (!ctx.shopHours) {
+      throw new ApiError(400, "Shop is closed on this day", "SHOP_CLOSED");
+    }
+    throw new ApiError(400, "This barber is off on this day", "WORKER_OFF");
+  }
 
-  if (slotHasConflict(startMin, endMin, ctx)) {
+  assertWithinWorkingHours(startMin, endMin, hours.start, hours.end);
+
+  if (hasConflict(ctx, workerId, startMin, endMin)) {
     throw new ApiError(409, "Selected slot is no longer available", "SLOT_TAKEN");
   }
 }
@@ -405,6 +514,89 @@ export async function isSlotAvailable(params: {
     }
     throw err;
   }
+}
+
+export interface StaffingItem {
+  serviceId: string;
+  /** The barber the customer chose; null lets the shop assign one ("any available"). */
+  workerId: string | null;
+  startTime: string;
+  endTime: string;
+}
+
+/**
+ * Give every "any available" item a barber who does its service and is free
+ * for its window, keeping the customer with the same barber across services
+ * when possible and never double-booking a barber within the batch. Items with
+ * a chosen barber keep it (check those with assertSlotBookable). Throws
+ * SLOT_TAKEN when no barber is free, OUTSIDE_HOURS when none works then.
+ * A service no barber is assigned to falls back to the shop-wide check and the
+ * item stays without a barber.
+ */
+export async function assignWorkers(params: {
+  shopId: string;
+  date: string;
+  items: StaffingItem[];
+  excludeBookingId?: string;
+  checkPast?: boolean;
+}): Promise<(string | null)[]> {
+  const open = params.items.filter((i) => !i.workerId);
+  if (open.length === 0) return params.items.map((i) => i.workerId);
+
+  validateDateString(params.date);
+
+  const candidatesByService = new Map<string, string[]>();
+  for (const serviceId of new Set(open.map((i) => i.serviceId))) {
+    candidatesByService.set(serviceId, await eligibleWorkerIds(params.shopId, serviceId));
+  }
+
+  const ctx = await loadShopDayContext(params.shopId, params.date, {
+    workerIds: [...candidatesByService.values()].flat(),
+    excludeBookingId: params.excludeBookingId,
+  });
+
+  // Chosen barbers are already busy with their own items in this batch.
+  const taken: Hold[] = params.items
+    .filter((i) => i.workerId)
+    .map((i) => ({
+      workerId: i.workerId,
+      start: parseTimeToMinutes(i.startTime),
+      end: parseTimeToMinutes(i.endTime),
+    }));
+
+  let previous: string | null = null;
+  return params.items.map((item) => {
+    if (item.workerId) {
+      previous = item.workerId;
+      return item.workerId;
+    }
+
+    const start = parseTimeToMinutes(item.startTime);
+    const end = parseTimeToMinutes(item.endTime);
+    if (params.checkPast !== false) {
+      assertNotPastSlot(params.date, start, ctx.timezone);
+    }
+
+    const candidates = candidatesByService.get(item.serviceId) ?? [];
+    const pool: (string | null)[] = candidates.length > 0 ? candidates : [null];
+    if (!pool.some((w) => withinHours(hoursFor(ctx, w), start, end))) {
+      throw new ApiError(400, "Selected time is outside shop working hours", "OUTSIDE_HOURS");
+    }
+
+    let workerId: string | null = null;
+    if (candidates.length > 0) {
+      workerId = pickFreeWorker(ctx, candidates, start, end, taken, previous);
+      if (!workerId) {
+        throw new ApiError(409, "Selected slot is no longer available", "SLOT_TAKEN");
+      }
+    } else if (hasConflict(ctx, null, start, end, taken)) {
+      throw new ApiError(409, "Selected slot is no longer available", "SLOT_TAKEN");
+    }
+
+    taken.push({ workerId, start, end });
+    previous = workerId;
+    return workerId;
+  });
 }
 
 export async function getAvailableSlots(params: {
@@ -452,40 +644,25 @@ export async function getAvailableSlots(params: {
     }
   }
 
-  let ctx: ShopSlotContext;
-  try {
-    ctx = await loadShopSlotContext(
-      params.shopId,
-      params.date,
-      params.workerId ?? null
-    );
-  } catch (err) {
-    if (err instanceof ApiError && err.code === "SHOP_CLOSED") {
-      return { slots: [], durationMinutes, pricePkr };
-    }
-    throw err;
-  }
+  // A chosen barber is checked alone; "any available" is open while any barber
+  // who does the service is free. Without such barbers the shop-wide check applies.
+  const eligible = params.workerId
+    ? [params.workerId]
+    : await eligibleWorkerIds(params.shopId, params.serviceId);
+  const candidates: (string | null)[] = eligible.length > 0 ? eligible : [null];
+
+  const ctx = await loadShopDayContext(params.shopId, params.date, { workerIds: eligible });
 
   const slots: SlotResult[] = [];
-
-  for (
-    let start = ctx.openMin;
-    start + durationMinutes <= ctx.closeMin;
-    start += SLOT_STEP_MINUTES
-  ) {
+  for (const start of candidateStarts(ctx, candidates, durationMinutes)) {
     const end = start + durationMinutes;
-    if (!slotHasConflict(start, end, ctx)) {
-      try {
-        assertNotPastSlot(params.date, start, ctx.timezone);
-      } catch {
-        continue;
-      }
-      slots.push({
-        startTime: minutesToTimeString(start),
-        endTime: minutesToTimeString(end),
-        durationMinutes,
-      });
-    }
+    if (isPastSlot(params.date, start, ctx.timezone)) continue;
+    if (!candidates.some((w) => isWorkerFree(ctx, w, start, end))) continue;
+    slots.push({
+      startTime: minutesToTimeString(start),
+      endTime: minutesToTimeString(end),
+      durationMinutes,
+    });
   }
 
   return { slots, durationMinutes, pricePkr };
@@ -512,56 +689,45 @@ export interface MultiSlotResult {
 
 interface ResolvedItem {
   serviceId: string;
-  workerId: string;
+  /** The chosen barber, or every barber who does the service for "any available" */
+  candidates: string[];
   serviceName: string;
   durationMinutes: number;
   pricePkr: number;
 }
 
-/** Pick a random eligible worker for a service (least-busy deferred to rating system). */
-async function pickRandomWorker(
-  shopId: string,
-  serviceId: string
-): Promise<string | null> {
-  const supabase = getSupabaseSecret();
-  const { data: eligible } = await supabase
-    .from("worker_services")
-    .select("worker_id")
-    .eq("service_id", serviceId);
+/** Lay the items out from `start`, giving each a free barber; null when one can't be staffed. */
+function scheduleItems(
+  ctx: ShopDayContext,
+  items: ResolvedItem[],
+  start: number,
+  gapMinutes: number
+): MultiSlotItem[] | null {
+  const schedule: MultiSlotItem[] = [];
+  const taken: Hold[] = [];
+  let cursor = start;
+  let previous: string | null = null;
 
-  if (!eligible || eligible.length === 0) return null;
+  for (const item of items) {
+    const itemStart = cursor;
+    const itemEnd = itemStart + item.durationMinutes;
+    const workerId = pickFreeWorker(ctx, item.candidates, itemStart, itemEnd, taken, previous);
+    if (!workerId) return null;
 
-  // Filter to workers that belong to this shop and are active
-  const workerIds = eligible.map((e) => e.worker_id);
-  const { data: activeWorkers } = await supabase
-    .from("workers")
-    .select("id")
-    .eq("shop_id", shopId)
-    .eq("is_active", true)
-    .in("id", workerIds);
-
-  if (!activeWorkers || activeWorkers.length === 0) return null;
-
-  const idx = Math.floor(Math.random() * activeWorkers.length);
-  return activeWorkers[idx].id;
-}
-
-/** Load per-worker booking ranges for a date (used by multi-slot calculation). */
-async function loadWorkerBookingRanges(
-  shopId: string,
-  date: string,
-  workerId: string
-): Promise<{ start: number; end: number }[]> {
-  return loadBlockingBookingRanges(shopId, date, workerId);
-}
-
-/** Check if a worker is free during a specific time window. */
-function workerIsFree(
-  workerStart: number,
-  workerEnd: number,
-  workerRanges: { start: number; end: number }[]
-): boolean {
-  return !workerRanges.some((r) => rangesOverlap(workerStart, workerEnd, r.start, r.end));
+    taken.push({ workerId, start: itemStart, end: itemEnd });
+    previous = workerId;
+    schedule.push({
+      serviceId: item.serviceId,
+      workerId,
+      serviceName: item.serviceName,
+      startTime: minutesToTimeString(itemStart),
+      endTime: minutesToTimeString(itemEnd),
+      durationMinutes: item.durationMinutes,
+      pricePkr: item.pricePkr,
+    });
+    cursor = itemEnd + gapMinutes;
+  }
+  return schedule;
 }
 
 export async function getMultiServiceSlots(params: {
@@ -572,7 +738,7 @@ export async function getMultiServiceSlots(params: {
   const supabase = getSupabaseSecret();
   validateDateString(params.date);
 
-  // 1. Resolve each item: fetch service, resolve worker
+  // 1. Resolve each item: its service and the barbers who may take it
   const resolvedItems: ResolvedItem[] = [];
   let totalPrice = 0;
 
@@ -590,50 +756,50 @@ export async function getMultiServiceSlots(params: {
       throw new ApiError(404, `Service not found: ${item.serviceId}`, "NOT_FOUND");
     }
 
-    let workerId = item.workerId ?? null;
-    if (!workerId) {
-      workerId = await pickRandomWorker(params.shopId, item.serviceId);
-    }
+    let candidates: string[];
+    if (item.workerId) {
+      // Verify worker belongs to shop and can perform this service
+      const { data: worker } = await supabase
+        .from("workers")
+        .select("id")
+        .eq("id", item.workerId)
+        .eq("shop_id", params.shopId)
+        .eq("is_active", true)
+        .maybeSingle();
 
-    if (!workerId) {
-      throw new ApiError(
-        400,
-        `No worker available for service: ${service.name}`,
-        "NO_WORKER_AVAILABLE"
-      );
-    }
+      if (!worker) {
+        throw new ApiError(404, "Worker not found for this shop", "NOT_FOUND");
+      }
 
-    // Verify worker belongs to shop and can perform this service
-    const { data: worker } = await supabase
-      .from("workers")
-      .select("id")
-      .eq("id", workerId)
-      .eq("shop_id", params.shopId)
-      .eq("is_active", true)
-      .maybeSingle();
+      const { data: ws } = await supabase
+        .from("worker_services")
+        .select("id")
+        .eq("worker_id", item.workerId)
+        .eq("service_id", item.serviceId)
+        .maybeSingle();
 
-    if (!worker) {
-      throw new ApiError(404, "Worker not found for this shop", "NOT_FOUND");
-    }
-
-    const { data: ws } = await supabase
-      .from("worker_services")
-      .select("id")
-      .eq("worker_id", workerId)
-      .eq("service_id", item.serviceId)
-      .maybeSingle();
-
-    if (!ws) {
-      throw new ApiError(
-        400,
-        `Worker cannot perform service: ${service.name}`,
-        "WORKER_NOT_QUALIFIED"
-      );
+      if (!ws) {
+        throw new ApiError(
+          400,
+          `Worker cannot perform service: ${service.name}`,
+          "WORKER_NOT_QUALIFIED"
+        );
+      }
+      candidates = [item.workerId];
+    } else {
+      candidates = await eligibleWorkerIds(params.shopId, item.serviceId);
+      if (candidates.length === 0) {
+        throw new ApiError(
+          400,
+          `No worker available for service: ${service.name}`,
+          "NO_WORKER_AVAILABLE"
+        );
+      }
     }
 
     resolvedItems.push({
       serviceId: item.serviceId,
-      workerId,
+      candidates,
       serviceName: service.name as string,
       durationMinutes: service.duration_minutes as number,
       pricePkr: service.price_pkr as number,
@@ -642,96 +808,34 @@ export async function getMultiServiceSlots(params: {
     totalPrice += service.price_pkr as number;
   }
 
-  // 2. Load shop context
-  let ctx: ShopSlotContext;
-  try {
-    ctx = await loadShopSlotContext(params.shopId, params.date, undefined);
-  } catch (err) {
-    if (err instanceof ApiError && err.code === "SHOP_CLOSED") {
-      return { slots: [], totalPricePkr: totalPrice };
-    }
-    throw err;
-  }
+  // 2. Load the day once, for every barber involved
+  const ctx = await loadShopDayContext(params.shopId, params.date, {
+    workerIds: resolvedItems.flatMap((i) => i.candidates),
+  });
 
-  // 3. Pre-load per-worker booking ranges (cache for the loop)
-  const workerIds = [...new Set(resolvedItems.map((i) => i.workerId))];
-  const workerBookingCache = new Map<string, { start: number; end: number }[]>();
-  for (const wid of workerIds) {
-    workerBookingCache.set(wid, await loadWorkerBookingRanges(params.shopId, params.date, wid));
-  }
-
-  // 4. Calculate total duration
+  // 3. Calculate total duration
   const totalDuration = resolvedItems.reduce((sum, i) => sum + i.durationMinutes, 0);
+  const first = resolvedItems[0];
 
-  // 5. Try contiguous slots, then with gaps
+  // 4. Try contiguous slots, then with gaps
   const gapOptions = [0, 15, 30];
   const allSlots: MultiSlotResult[] = [];
 
   for (const gapMinutes of gapOptions) {
     const effectiveDuration = totalDuration + gapMinutes * Math.max(0, resolvedItems.length - 1);
 
-    for (
-      let start = ctx.openMin;
-      start + effectiveDuration <= ctx.closeMin;
-      start += SLOT_STEP_MINUTES
-    ) {
-      // Compute per-item windows
-      const itemSchedule: MultiSlotItem[] = [];
-      let cursor = start;
-      let allFree = true;
+    for (const start of candidateStarts(ctx, first.candidates, first.durationMinutes)) {
+      if (isPastSlot(params.date, start, ctx.timezone)) continue;
 
-      for (const item of resolvedItems) {
-        const itemStart = cursor;
-        const itemEnd = itemStart + item.durationMinutes;
+      const itemSchedule = scheduleItems(ctx, resolvedItems, start, gapMinutes);
+      if (!itemSchedule) continue;
 
-        // Check within working hours
-        if (itemStart < ctx.openMin || itemEnd > ctx.closeMin) {
-          allFree = false;
-          break;
-        }
-
-        // Check worker is free
-        const workerRanges = workerBookingCache.get(item.workerId) ?? [];
-        if (!workerIsFree(itemStart, itemEnd, workerRanges)) {
-          allFree = false;
-          break;
-        }
-
-        // Check no conflict with shop-level busy blocks
-        if (slotHasConflict(itemStart, itemEnd, ctx)) {
-          allFree = false;
-          break;
-        }
-
-        itemSchedule.push({
-          serviceId: item.serviceId,
-          workerId: item.workerId,
-          serviceName: item.serviceName,
-          startTime: minutesToTimeString(itemStart),
-          endTime: minutesToTimeString(itemEnd),
-          durationMinutes: item.durationMinutes,
-          pricePkr: item.pricePkr,
-        });
-
-        cursor = itemEnd + gapMinutes;
-      }
-
-      if (allFree && itemSchedule.length === resolvedItems.length) {
-        // Check not in the past
-        try {
-          assertNotPastSlot(params.date, start, ctx.timezone);
-        } catch {
-          continue;
-        }
-
-        const lastItem = itemSchedule[itemSchedule.length - 1];
-        allSlots.push({
-          startTime: itemSchedule[0].startTime,
-          endTime: lastItem.endTime,
-          totalDuration: effectiveDuration,
-          items: itemSchedule,
-        });
-      }
+      allSlots.push({
+        startTime: itemSchedule[0].startTime,
+        endTime: itemSchedule[itemSchedule.length - 1].endTime,
+        totalDuration: effectiveDuration,
+        items: itemSchedule,
+      });
     }
 
     // If we found slots with this gap level, don't try larger gaps

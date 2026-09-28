@@ -10,6 +10,7 @@ import { assertShopOwner, getShopOwnerId } from "../lib/shop";
 import { withShopDateLock } from "../lib/booking-lock";
 import {
   assertSlotBookable,
+  assignWorkers,
   computeCommission,
 } from "./availability.service";
 import { expireUnpaidBookings } from "./booking-expiry.service";
@@ -98,22 +99,9 @@ export async function createBooking(params: {
     throw new ApiError(404, "Service not found", "NOT_FOUND");
   }
 
-  // Auto-pick a worker when "Any available" selected
-  let resolvedWorkerId = params.workerId ?? null;
-  if (!resolvedWorkerId) {
-    const { data: eligibleWorkers } = await supabase
-      .from("worker_services")
-      .select("worker_id")
-      .eq("service_id", params.serviceId);
-
-    if (eligibleWorkers && eligibleWorkers.length > 0) {
-      // Pick first eligible worker (future: round-robin / least-busy)
-      resolvedWorkerId = eligibleWorkers[0].worker_id;
-    }
-  }
-
-  if (resolvedWorkerId) {
-    await assertWorkerBelongsToShop(params.shopId, resolvedWorkerId);
+  const chosenWorkerId = params.workerId ?? null;
+  if (chosenWorkerId) {
+    await assertWorkerBelongsToShop(params.shopId, chosenWorkerId);
   }
 
   const duration =
@@ -121,16 +109,33 @@ export async function createBooking(params: {
   const price = params.requestedPricePkr ?? (service.price_pkr as number);
   const endTime = endTimeFromStartAndDuration(params.startTime, duration);
 
+  // A chosen barber is checked on their own calendar; "Any available" gets
+  // whichever barber who does this service is free at that time.
+  const staffBooking = async (): Promise<string | null> => {
+    if (chosenWorkerId) {
+      await assertSlotBookable({
+        shopId: params.shopId,
+        date: params.bookingDate,
+        startTime: params.startTime,
+        endTime,
+        workerId: chosenWorkerId,
+        requireApproved: true,
+        checkPast: true,
+      });
+      return chosenWorkerId;
+    }
+    const [workerId] = await assignWorkers({
+      shopId: params.shopId,
+      date: params.bookingDate,
+      items: [
+        { serviceId: params.serviceId, workerId: null, startTime: params.startTime, endTime },
+      ],
+    });
+    return workerId;
+  };
+
   // Soft check for fast feedback before acquiring the lock.
-  await assertSlotBookable({
-    shopId: params.shopId,
-    date: params.bookingDate,
-    startTime: params.startTime,
-    endTime,
-    workerId: resolvedWorkerId,
-    requireApproved: true,
-    checkPast: true,
-  });
+  await staffBooking();
 
   const commission = computeCommission(price);
   const paymentDueAt = paymentDueAtFromNow();
@@ -139,23 +144,15 @@ export async function createBooking(params: {
   // holding an advisory lock, so concurrent bookings for the same slot cannot
   // both pass the check (TOCTOU / double-booking fix).
   return withShopDateLock(params.shopId, params.bookingDate, async () => {
-    // Authoritative re-check under the lock.
-    await assertSlotBookable({
-      shopId: params.shopId,
-      date: params.bookingDate,
-      startTime: params.startTime,
-      endTime,
-      workerId: resolvedWorkerId,
-      requireApproved: true,
-      checkPast: true,
-    });
+    // Authoritative re-check (and barber pick) under the lock.
+    const workerId = await staffBooking();
 
     const { data, error } = await supabase
       .from("bookings")
       .insert({
         customer_id: params.customerId,
         shop_id: params.shopId,
-        worker_id: resolvedWorkerId,
+        worker_id: workerId,
         service_id: params.serviceId,
         booking_date: params.bookingDate,
         start_time: params.startTime,
@@ -248,21 +245,11 @@ export async function createBatchBookings(params: {
       );
     }
 
-    // Resolve worker
-    let resolvedWorkerId = item.workerId ?? null;
-    if (!resolvedWorkerId) {
-      const { data: eligibleWorkers } = await supabase
-        .from("worker_services")
-        .select("worker_id")
-        .eq("service_id", item.serviceId);
-
-      if (eligibleWorkers && eligibleWorkers.length > 0) {
-        resolvedWorkerId = eligibleWorkers[0].worker_id;
-      }
-    }
-
-    if (resolvedWorkerId) {
-      await assertWorkerBelongsToShop(params.shopId, resolvedWorkerId);
+    // A chosen barber must belong to the shop; "Any available" items get a
+    // free barber assigned under the booking lock below.
+    const workerId = item.workerId ?? null;
+    if (workerId) {
+      await assertWorkerBelongsToShop(params.shopId, workerId);
     }
 
     const duration = service.duration_minutes as number;
@@ -271,7 +258,7 @@ export async function createBatchBookings(params: {
 
     resolvedItems.push({
       serviceId: item.serviceId,
-      workerId: resolvedWorkerId,
+      workerId,
       startTime: item.startTime,
       duration,
       price,
@@ -304,18 +291,35 @@ export async function createBatchBookings(params: {
     }
   }
 
-  // Soft check for fast feedback before acquiring the lock.
-  for (const item of resolvedItems) {
-    await assertSlotBookable({
+  // Chosen barbers are checked on their own calendars; "Any available" items
+  // get a barber who does the service and is free then (see assignWorkers).
+  const staffItems = async (): Promise<(string | null)[]> => {
+    for (const item of resolvedItems) {
+      if (!item.workerId) continue;
+      await assertSlotBookable({
+        shopId: params.shopId,
+        date: params.bookingDate,
+        startTime: item.startTime,
+        endTime: item.endTime,
+        workerId: item.workerId,
+        requireApproved: true,
+        checkPast: true,
+      });
+    }
+    return assignWorkers({
       shopId: params.shopId,
       date: params.bookingDate,
-      startTime: item.startTime,
-      endTime: item.endTime,
-      workerId: item.workerId,
-      requireApproved: true,
-      checkPast: true,
+      items: resolvedItems.map((i) => ({
+        serviceId: i.serviceId,
+        workerId: i.workerId,
+        startTime: i.startTime,
+        endTime: i.endTime,
+      })),
     });
-  }
+  };
+
+  // Soft check for fast feedback before acquiring the lock.
+  await staffItems();
 
   // Compute overall booking window and total price
   const sortedByStart = [...resolvedItems].sort(
@@ -330,20 +334,11 @@ export async function createBatchBookings(params: {
   // (shop, date) so concurrent batches for the same slot serialize and the
   // re-check below sees already-committed rows (TOCTOU / double-booking fix).
   return withShopDateLock(params.shopId, params.bookingDate, async () => {
-    // Authoritative re-check under the lock.
-    for (const item of resolvedItems) {
-      await assertSlotBookable({
-        shopId: params.shopId,
-        date: params.bookingDate,
-        startTime: item.startTime,
-        endTime: item.endTime,
-        workerId: item.workerId,
-        requireApproved: true,
-        checkPast: true,
-      });
-    }
+    // Authoritative re-check (and barber pick) under the lock.
+    const workerIds = await staffItems();
+    const staffedItems = resolvedItems.map((item, i) => ({ ...item, workerId: workerIds[i] }));
 
-    const firstItem = sortedByStart[0];
+    const firstItem = staffedItems[resolvedItems.indexOf(sortedByStart[0])];
     const commission = computeCommission(totalPricePkr);
     const paymentDueAt = paymentDueAtFromNow();
 
@@ -382,7 +377,7 @@ export async function createBatchBookings(params: {
     }
 
     // Create booking_items rows
-    const itemsToInsert = resolvedItems.map((i) => ({
+    const itemsToInsert = staffedItems.map((i) => ({
       booking_id: booking.id,
       service_id: i.serviceId,
       worker_id: i.workerId,
@@ -426,6 +421,61 @@ export async function createBatchBookings(params: {
       bookingId: booking.id,
     };
   });
+}
+
+/**
+ * Re-check a booking's time before approval. Multi-service bookings are checked
+ * item by item, each on its own barber's calendar (the booking row only names
+ * the first barber); extra time added at approval goes to the last barber.
+ */
+async function assertBookingStillFits(
+  booking: Record<string, unknown>,
+  endTime: string
+): Promise<void> {
+  const base = {
+    shopId: booking.shop_id as string,
+    date: booking.booking_date as string,
+    excludeBookingId: booking.id as string,
+    requireApproved: false,
+    checkPast: false,
+  };
+
+  const { data: items, error } = await getSupabaseSecret()
+    .from("booking_items")
+    .select("worker_id, start_time, end_time")
+    .eq("booking_id", booking.id as string)
+    .order("start_time", { ascending: true });
+
+  if (error) throw new ApiError(500, error.message, "DB_ERROR");
+
+  if (!items?.length) {
+    await assertSlotBookable({
+      ...base,
+      startTime: booking.start_time as string,
+      endTime,
+      workerId: (booking.worker_id as string | null) ?? null,
+    });
+    return;
+  }
+
+  for (const item of items) {
+    await assertSlotBookable({
+      ...base,
+      startTime: item.start_time as string,
+      endTime: item.end_time as string,
+      workerId: (item.worker_id as string | null) ?? null,
+    });
+  }
+
+  const last = items[items.length - 1];
+  if (parseTimeToMinutes(endTime) > parseTimeToMinutes(last.end_time as string)) {
+    await assertSlotBookable({
+      ...base,
+      startTime: last.end_time as string,
+      endTime,
+      workerId: (last.worker_id as string | null) ?? null,
+    });
+  }
 }
 
 export async function approveBooking(params: {
@@ -480,16 +530,7 @@ export async function approveBooking(params: {
     finalDuration
   );
 
-  await assertSlotBookable({
-    shopId: booking.shop_id as string,
-    date: booking.booking_date as string,
-    startTime: booking.start_time as string,
-    endTime,
-    workerId: (booking.worker_id as string | null) ?? null,
-    excludeBookingId: params.bookingId,
-    requireApproved: false,
-    checkPast: false,
-  });
+  await assertBookingStillFits(booking, endTime);
 
   const commission = computeCommission(finalPrice);
 
@@ -705,7 +746,8 @@ async function applyBookingPaymentStatus(
 
 type BookingItemAttachRow = {
   booking_id: string;
-  service_id: string;
+  // NULL once the service is deleted; shop_services then joins as null too.
+  service_id: string | null;
   worker_id: string | null;
   start_time?: string;
   end_time?: string;
