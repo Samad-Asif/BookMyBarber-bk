@@ -222,7 +222,7 @@ async function resolveTargetsFromBooking(
     .eq("booking_id", bookingId);
 
   type ItemRow = {
-    service_id: string;
+    service_id: string | null;
     worker_id: string | null;
     shop_services: { name: string } | { name: string }[] | null;
     workers: { name: string } | { name: string }[] | null;
@@ -231,7 +231,14 @@ async function resolveTargetsFromBooking(
   const itemRows = (items ?? []) as unknown as ItemRow[];
 
   if (itemRows.length > 0) {
-    return itemRows.map((item) => {
+    // A deleted service or worker leaves a NULL id on the item. A target must
+    // reference one of the two and is unique per (review, service, worker), so
+    // skip items with neither and collapse duplicates.
+    const targets = new Map<string, ReviewTargetInput>();
+    for (const item of itemRows) {
+      if (!item.service_id && !item.worker_id) continue;
+      const key = `${item.service_id ?? ""}|${item.worker_id ?? ""}`;
+      if (targets.has(key)) continue;
       const serviceRel = item.shop_services;
       const workerRel = item.workers;
       const serviceName = Array.isArray(serviceRel)
@@ -240,13 +247,14 @@ async function resolveTargetsFromBooking(
       const workerName = Array.isArray(workerRel)
         ? workerRel[0]?.name
         : workerRel?.name;
-      return {
-        serviceId: item.service_id,
+      targets.set(key, {
+        serviceId: item.service_id ?? undefined,
         workerId: item.worker_id ?? undefined,
         serviceName: serviceName ?? null,
         workerName: workerName ?? null,
-      };
-    });
+      });
+    }
+    return [...targets.values()];
   }
 
   // Single-service booking fallback (header row only)
@@ -565,7 +573,7 @@ export async function listReviewableBookings(shopId: string, customerId: string)
 
   type ItemJoin = {
     booking_id: string;
-    service_id: string;
+    service_id: string | null;
     worker_id: string | null;
     shop_services: { id: string; name: string } | { id: string; name: string }[] | null;
     workers: { id: string; name: string } | { id: string; name: string }[] | null;
