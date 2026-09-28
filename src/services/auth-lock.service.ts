@@ -11,7 +11,7 @@ export async function checkAccountLocked(email: string): Promise<void> {
     const { data, error } = await supabase
         .from("profiles")
         .select("locked_until")
-        .ilike("email", email.trim().toLowerCase())
+        .eq("email",email.trim().toLowerCase())
         .maybeSingle();
 
     if (error) {
@@ -40,7 +40,7 @@ export async function trackOtpSend(email: string): Promise<void> {
     const { data } = await supabase
         .from("profiles")
         .select("otp_send_count, otp_window_start")
-        .ilike("email", normalized)
+        .eq("email",normalized)
         .maybeSingle();
 
     const windowStart = data?.otp_window_start
@@ -62,7 +62,7 @@ export async function trackOtpSend(email: string): Promise<void> {
             otp_window_start: isExpired ? now : (data?.otp_window_start ?? now),
             updated_at: now,
         })
-        .ilike("email", normalized);
+        .eq("email",normalized);
 
     if (error) {
         throw new ApiError(500, error.message, "DB_ERROR");
@@ -77,7 +77,7 @@ export async function trackFailedVerify(email: string): Promise<void> {
     const { data } = await supabase
         .from("profiles")
         .select("otp_fail_count, otp_window_start")
-        .ilike("email", normalized)
+        .eq("email",normalized)
         .maybeSingle();
 
     const windowStart = data?.otp_window_start
@@ -99,7 +99,7 @@ export async function trackFailedVerify(email: string): Promise<void> {
             otp_window_start: isExpired ? now : (data?.otp_window_start ?? now),
             updated_at: now,
         })
-        .ilike("email", normalized);
+        .eq("email",normalized);
 
     if (error) {
         throw new ApiError(500, error.message, "DB_ERROR");
@@ -121,7 +121,7 @@ export async function lockAccount(email: string): Promise<void> {
             otp_window_start: now,
             updated_at: now,
         })
-        .ilike("email", normalized);
+        .eq("email",normalized);
 
     if (error) {
         throw new ApiError(500, error.message, "DB_ERROR");
@@ -157,7 +157,7 @@ export async function resetCounters(email: string): Promise<void> {
             otp_window_start: now,
             updated_at: now,
         })
-        .ilike("email", email.trim().toLowerCase());
+        .eq("email",email.trim().toLowerCase());
 
     if (error) {
         throw new ApiError(500, error.message, "DB_ERROR");

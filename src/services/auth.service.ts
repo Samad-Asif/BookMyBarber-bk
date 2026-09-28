@@ -172,10 +172,13 @@ async function issueSession(
 
 async function findProfileByEmail(email: string): Promise<ProfileRow | null> {
   const supabase = getSupabaseSecret();
+  // Exact match on the stored (lowercase) address. Never ilike: "_" and "%" are
+  // wildcards there, so "ali_khan@…" would also find "ali.khan@…" and send that
+  // account's password reset to someone else's inbox.
   const { data, error } = await supabase
     .from("profiles")
     .select(PROFILE_SELECT)
-    .ilike("email", email)
+    .eq("email", email.trim().toLowerCase())
     .maybeSingle();
 
   if (error) throw new ApiError(500, error.message, "DB_ERROR");
