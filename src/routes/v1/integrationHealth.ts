@@ -3,6 +3,7 @@ import { isGeminiConfigured } from "../../services/gemini.service";
 import { checkPollinationsLive } from "../../services/pollinations.service";
 import { loadMailEnv } from "../../config/mailEnv";
 import { verifyEmailTransport } from "../../services/email.service";
+import { isGoogleWebAuthConfigured, loadAuthEnv } from "../../config/authEnv";
 import { GoogleGenAI } from "@google/genai";
 
 type CheckStatus = "ok" | "degraded" | "error" | "skipped";
@@ -152,6 +153,29 @@ function checkApiBaseUrl(): IntegrationCheck {
   };
 }
 
+/** "Continue with Google" in the app (browser sign-in). Optional, so unset is "skipped". */
+function checkGoogleSignIn(): IntegrationCheck {
+  const env = loadAuthEnv();
+  if (isGoogleWebAuthConfigured(env)) {
+    return {
+      status: "ok",
+      configured: true,
+      message: `Google sign-in on; authorized redirect URI: ${env.googleAuthRedirectUri}`,
+    };
+  }
+  const missing = [
+    !env.googleWebClientId && "GOOGLE_CLIENT_ID",
+    !env.googleClientSecret && "GOOGLE_CLIENT_SECRET",
+    !env.googleAuthRedirectUri && "GOOGLE_AUTH_REDIRECT_URI (or API_BASE_URL)",
+  ].filter((m): m is string => Boolean(m));
+  return {
+    status: "skipped",
+    configured: false,
+    missing,
+    message: `Google sign-in off — set ${missing.join(", ")}`,
+  };
+}
+
 function checkGeminiAnalysis(): IntegrationCheck {
   if (!isGeminiConfigured()) {
     return { status: "skipped", configured: false, message: "Skipped — no Gemini key" };
@@ -230,6 +254,7 @@ export async function runIntegrationHealthChecks(): Promise<{
   const supabaseJwt = checkSupabaseJwt();
   const cron = checkCronSecrets();
   const apiBaseUrl = checkApiBaseUrl();
+  const googleSignIn = checkGoogleSignIn();
 
   const integrations = {
     gemini,
@@ -239,6 +264,7 @@ export async function runIntegrationHealthChecks(): Promise<{
     supabaseJwt,
     cron,
     apiBaseUrl,
+    googleSignIn,
     geminiAnalysis: geminiFlag,
     cloudinaryConfigured: cloudinaryFlag,
   };

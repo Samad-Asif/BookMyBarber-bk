@@ -7,6 +7,7 @@ import {
   loadAuthEnv,
   validateAuthEnv,
   isGoogleAuthConfigured,
+  isGoogleWebAuthConfigured,
   isMicrosoftAuthConfigured,
 } from "../config/authEnv";
 import { ApiError } from "../lib/errors";
@@ -252,6 +253,8 @@ async function linkOAuthToProfile(
     name: string;
     google_sub: string;
     microsoft_oid: string;
+    email_verified_at: string;
+    password_hash: null;
   }>
 ): Promise<ProfileRow> {
   const supabase = getSupabaseSecret();
@@ -436,9 +439,15 @@ export async function verifyEmail(
   return issueSession(mapProfile(profile));
 }
 
+/**
+ * Sign in with a Google ID token (from a native SDK, or fetched by the browser
+ * flow below). An existing account is matched by Google id, or by email only
+ * when Google has verified that address. `role` applies to new accounts.
+ */
 export async function signInWithGoogle(
   idToken: string,
-  userAgent?: string
+  userAgent?: string,
+  role: UserRole = "customer"
 ): Promise<AuthSessionResponse> {
   const env = loadAuthEnv();
   if (!isGoogleAuthConfigured(env)) {
@@ -446,7 +455,7 @@ export async function signInWithGoogle(
   }
 
   const client = new OAuth2Client(env.googleClientIds[0]);
-  let payload: { sub?: string; email?: string; name?: string };
+  let payload: { sub?: string; email?: string; email_verified?: boolean; name?: string };
   try {
     const ticket = await client.verifyIdToken({
       idToken,
@@ -461,29 +470,157 @@ export async function signInWithGoogle(
     throw new ApiError(401, "Invalid Google token", "AUTH_FAILED");
   }
 
+  // An unverified address could be anyone's, so it may neither match nor create an account.
+  const email = payload.email_verified ? payload.email?.trim().toLowerCase() : undefined;
+
   let profile =
     (await findProfileByGoogleSub(payload.sub)) ??
-    (payload.email ? await findProfileByEmail(payload.email) : null);
+    (email ? await findProfileByEmail(email) : null);
 
   if (profile) {
-    if (!profile.google_sub || profile.google_sub !== payload.sub) {
-      profile = await linkOAuthToProfile(profile.id, {
-        google_sub: payload.sub,
-        email: profile.email ?? payload.email,
-        name: profile.name ?? payload.name,
-      });
+    const patch: Parameters<typeof linkOAuthToProfile>[1] = {};
+    if (profile.google_sub !== payload.sub) patch.google_sub = payload.sub;
+    if (!profile.email && email) patch.email = email;
+    if (!profile.name && payload.name) patch.name = payload.name;
+    if (!profile.email_verified_at && email && profile.email === email) {
+      // Google just proved who owns this address. A password set on it before it
+      // was verified may be someone else's (account pre-hijacking), so drop it.
+      patch.email_verified_at = new Date().toISOString();
+      patch.password_hash = null;
+    }
+    if (Object.keys(patch).length > 0) {
+      profile = await linkOAuthToProfile(profile.id, patch);
     }
   } else {
+    if (!email) {
+      throw new ApiError(
+        401,
+        "Your Google account's email address isn't verified",
+        "AUTH_FAILED"
+      );
+    }
     profile = await createProfile({
-      email: payload.email ?? null,
+      email,
       name: payload.name ?? null,
-      role: "customer",
+      role,
       googleSub: payload.sub,
       emailVerifiedAt: new Date().toISOString(),
     });
   }
 
   return issueSession(mapProfile(profile), userAgent);
+}
+
+// ── Google sign-in through the browser (PKCE) ───────────────────────────────
+// The app opens Google in a browser tab; Google returns to our callback, which
+// hands a one-time code back to the app's deep link; the app then trades that
+// code plus its PKCE verifier for a session. Only the web OAuth client is
+// needed, and a code intercepted on the way back is useless without the
+// verifier, which never leaves the app.
+
+const GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_FLOW_AUDIENCE = "bmb-google-sign-in";
+/** The browser flow only ever returns to the app itself. */
+const APP_REDIRECT_PREFIX = "bookmybarberapp://";
+
+/** Its own key, so a sign-in state token can never pass as an access token. */
+function googleFlowSecret(): string {
+  return `${getAuthEnv().jwtAccessSecret}:google-sign-in`;
+}
+
+function assertGoogleWebAuthConfigured() {
+  const env = loadAuthEnv();
+  if (!isGoogleWebAuthConfigured(env)) {
+    throw new ApiError(500, "Google auth not configured", "AUTH_CONFIG_ERROR");
+  }
+  return env;
+}
+
+/** Step 1: Google's sign-in URL for the app to open. */
+export function getGoogleLoginAuthUrl(params: {
+  redirectUri: string;
+  codeChallenge: string;
+  state: string;
+}): string {
+  const env = assertGoogleWebAuthConfigured();
+  if (!params.redirectUri.startsWith(APP_REDIRECT_PREFIX)) {
+    throw new ApiError(400, "Unsupported redirectUri", "VALIDATION_ERROR");
+  }
+
+  const flow = jwt.sign({ r: params.redirectUri, s: params.state }, googleFlowSecret(), {
+    audience: GOOGLE_FLOW_AUDIENCE,
+    expiresIn: "10m",
+  });
+
+  const query = new URLSearchParams({
+    client_id: env.googleWebClientId,
+    redirect_uri: env.googleAuthRedirectUri,
+    response_type: "code",
+    scope: "openid email profile",
+    state: flow,
+    code_challenge: params.codeChallenge,
+    code_challenge_method: "S256",
+    prompt: "select_account",
+  });
+  return `${GOOGLE_AUTHORIZE_URL}?${query}`;
+}
+
+/** Step 2: Google sent the browser to our callback; the app deep link to forward it to. */
+export function getGoogleCallbackRedirect(query: {
+  code?: string;
+  state?: string;
+  error?: string;
+}): string {
+  let flow: jwt.JwtPayload;
+  try {
+    flow = jwt.verify(query.state ?? "", googleFlowSecret(), {
+      audience: GOOGLE_FLOW_AUDIENCE,
+    }) as jwt.JwtPayload;
+  } catch {
+    throw new ApiError(
+      400,
+      "This sign-in link has expired. Close this window and try again from the app.",
+      "AUTH_FAILED"
+    );
+  }
+
+  const target = flow.r;
+  if (typeof target !== "string" || !target.startsWith(APP_REDIRECT_PREFIX) || typeof flow.s !== "string") {
+    throw new ApiError(400, "Invalid sign-in request", "AUTH_FAILED");
+  }
+
+  const result = new URLSearchParams({ state: flow.s });
+  if (query.code) result.set("code", query.code);
+  else result.set("error", query.error || "access_denied");
+  return `${target}${target.includes("?") ? "&" : "?"}${result}`;
+}
+
+/** Step 3: the app trades the code and its PKCE verifier for a session. */
+export async function signInWithGoogleCode(
+  code: string,
+  codeVerifier: string,
+  userAgent?: string,
+  role: UserRole = "customer"
+): Promise<AuthSessionResponse> {
+  const env = assertGoogleWebAuthConfigured();
+  const client = new OAuth2Client(
+    env.googleWebClientId,
+    env.googleClientSecret,
+    env.googleAuthRedirectUri
+  );
+
+  let idToken: string | null | undefined;
+  try {
+    const { tokens } = await client.getToken({ code, codeVerifier });
+    idToken = tokens.id_token;
+  } catch {
+    throw new ApiError(401, "Google authentication failed", "AUTH_FAILED");
+  }
+  if (!idToken) {
+    throw new ApiError(401, "Google authentication failed", "AUTH_FAILED");
+  }
+
+  return signInWithGoogle(idToken, userAgent, role);
 }
 
 export function getMicrosoftLoginAuthUrl(

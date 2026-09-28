@@ -9,6 +9,9 @@ import {
   signOut,
   signUp,
   signInWithGoogle,
+  getGoogleLoginAuthUrl,
+  getGoogleCallbackRedirect,
+  signInWithGoogleCode,
   getMicrosoftLoginAuthUrl,
   signInWithMicrosoftCode,
   refreshSession,
@@ -28,6 +31,8 @@ import {
 import {
   forgotPasswordBodySchema,
   googleBodySchema,
+  googleConnectQuerySchema,
+  googleExchangeBodySchema,
   loginBodySchema,
   logoutBodySchema,
   microsoftExchangeBodySchema,
@@ -114,13 +119,61 @@ router.post(
   })
 );
 
-/** POST /v1/auth/google — public */
+/** POST /v1/auth/google — public (Google ID token from a native SDK) */
 router.post(
   "/google",
   authOAuthLimiter,
   asyncHandler(async (req: Request, res: Response) => {
-    const { idToken } = parseBody(googleBodySchema, req.body);
-    const result = await signInWithGoogle(idToken, userAgent(req));
+    const { idToken, role } = parseBody(googleBodySchema, req.body);
+    const result = await signInWithGoogle(idToken, userAgent(req), role);
+    res.json(result);
+  })
+);
+
+/** GET /v1/auth/google/connect — public; starts browser sign-in (PKCE) */
+router.get(
+  "/google/connect",
+  authOAuthLimiter,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { redirectUri, codeChallenge, state } = parseBody(
+      googleConnectQuerySchema,
+      req.query
+    );
+    res.json({ authUrl: getGoogleLoginAuthUrl({ redirectUri, codeChallenge, state }) });
+  })
+);
+
+/** GET /v1/auth/google/callback — public; Google sends the browser here */
+router.get(
+  "/google/callback",
+  authOAuthLimiter,
+  asyncHandler(async (req: Request, res: Response) => {
+    const query = (key: string) =>
+      typeof req.query[key] === "string" ? (req.query[key] as string) : undefined;
+    try {
+      res.redirect(
+        302,
+        getGoogleCallbackRedirect({
+          code: query("code"),
+          state: query("state"),
+          error: query("error"),
+        })
+      );
+    } catch (err) {
+      // A person is looking at this browser tab: plain text, not JSON
+      if (!(err instanceof ApiError)) throw err;
+      res.status(err.statusCode).type("text/plain").send(err.message);
+    }
+  })
+);
+
+/** POST /v1/auth/google/exchange — public; code + PKCE verifier → session */
+router.post(
+  "/google/exchange",
+  authOAuthLimiter,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { code, codeVerifier, role } = parseBody(googleExchangeBodySchema, req.body);
+    const result = await signInWithGoogleCode(code, codeVerifier, userAgent(req), role);
     res.json(result);
   })
 );

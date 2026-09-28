@@ -45,8 +45,27 @@ export const resendVerificationBodySchema = z.object({
   email: emailSchema,
 });
 
+/** Role for an account created by social sign-in (never admin) */
+const socialSignupRole = z.enum(["customer", "barber"]).optional();
+
 export const googleBodySchema = z.object({
   idToken: z.string().min(1, "idToken is required"),
+  role: socialSignupRole,
+});
+
+export const googleConnectQuerySchema = z.object({
+  // Deep links (bookmybarberapp://…) are not always valid absolute URLs for z.url()
+  redirectUri: z.string().trim().min(1, "redirectUri is required").max(500),
+  codeChallenge: z
+    .string()
+    .regex(/^[A-Za-z0-9_-]{43,128}$/, "codeChallenge must be a base64url SHA-256 challenge"),
+  state: z.string().regex(/^[A-Za-z0-9_-]{8,128}$/, "state is invalid"),
+});
+
+export const googleExchangeBodySchema = z.object({
+  code: z.string().min(1, "code is required").max(2048),
+  codeVerifier: z.string().regex(/^[A-Za-z0-9._~-]{43,128}$/, "codeVerifier is invalid"),
+  role: socialSignupRole,
 });
 
 export const microsoftExchangeBodySchema = z.object({

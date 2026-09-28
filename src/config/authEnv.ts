@@ -3,6 +3,11 @@ export interface AuthEnvConfig {
   jwtAccessTtl: string;
   jwtRefreshTtlDays: number;
   googleClientIds: string[];
+  /** Web OAuth client used for the browser sign-in flow (GOOGLE_CLIENT_ID) */
+  googleWebClientId: string;
+  googleClientSecret: string;
+  /** Where Google sends the browser back; must be registered on the web client */
+  googleAuthRedirectUri: string;
   microsoftClientId: string;
   microsoftClientSecret: string;
   microsoftTenantId: string;
@@ -31,6 +36,13 @@ export function loadAuthEnv(): AuthEnvConfig {
     jwtAccessTtl: firstDefined(process.env.JWT_ACCESS_TTL) || "15m",
     jwtRefreshTtlDays: Number(process.env.JWT_REFRESH_TTL_DAYS ?? "30") || 30,
     googleClientIds: googleIds,
+    googleWebClientId: firstDefined(process.env.GOOGLE_CLIENT_ID),
+    googleClientSecret: firstDefined(process.env.GOOGLE_CLIENT_SECRET),
+    googleAuthRedirectUri:
+      firstDefined(process.env.GOOGLE_AUTH_REDIRECT_URI) ||
+      (process.env.API_BASE_URL?.trim()
+        ? `${process.env.API_BASE_URL.trim().replace(/\/$/, "")}/v1/auth/google/callback`
+        : ""),
     microsoftClientId: firstDefined(process.env.MICROSOFT_CLIENT_ID),
     microsoftClientSecret: firstDefined(process.env.MICROSOFT_CLIENT_SECRET),
     microsoftTenantId: firstDefined(process.env.MICROSOFT_TENANT_ID) || "common",
@@ -50,6 +62,13 @@ export function validateAuthEnv(config: AuthEnvConfig): {
 
 export function isGoogleAuthConfigured(config: AuthEnvConfig): boolean {
   return config.googleClientIds.length > 0;
+}
+
+/** Browser sign-in (connect → callback → exchange) needs the web client's secret too. */
+export function isGoogleWebAuthConfigured(config: AuthEnvConfig): boolean {
+  return Boolean(
+    config.googleWebClientId && config.googleClientSecret && config.googleAuthRedirectUri
+  );
 }
 
 export function isMicrosoftAuthConfigured(config: AuthEnvConfig): boolean {
